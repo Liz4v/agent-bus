@@ -88,6 +88,8 @@ type Sweeper struct {
 	store   *Store
 	tracker *Tracker
 	log     *slog.Logger
+	// Interval is the time between sweeps (default protocol.SweepInterval).
+	Interval time.Duration
 }
 
 // NewSweeper builds a sweeper. log may be nil.
@@ -95,12 +97,12 @@ func NewSweeper(store *Store, tracker *Tracker, log *slog.Logger) *Sweeper {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Sweeper{store: store, tracker: tracker, log: log}
+	return &Sweeper{store: store, tracker: tracker, log: log, Interval: protocol.SweepInterval}
 }
 
 // Run sweeps every protocol.SweepInterval until ctx is done.
 func (sw *Sweeper) Run(ctx context.Context) {
-	tick := time.NewTicker(protocol.SweepInterval)
+	tick := time.NewTicker(sw.Interval)
 	defer tick.Stop()
 	for {
 		select {

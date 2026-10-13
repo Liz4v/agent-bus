@@ -70,6 +70,12 @@ func CheckSocketDir(dir string, uid int) error {
 	return nil
 }
 
+// WakeOptionsFromEnv returns options that honour $XDG_RUNTIME_DIR (D7); without
+// it the socket directory falls back to os.TempDir()/agent-bus-<uid>.
+func WakeOptionsFromEnv() WakeOptions {
+	return WakeOptions{RuntimeDir: os.Getenv("XDG_RUNTIME_DIR")}
+}
+
 // WakeDir returns the directory the shim uses for its socket and index file.
 func WakeDir(opt WakeOptions) string {
 	if opt.RuntimeDir != "" {

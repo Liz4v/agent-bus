@@ -2,11 +2,14 @@ package broker
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -369,5 +372,139 @@ func TestLogsHoldNoSecrets(t *testing.T) {
 		if strings.Contains(logs, secretStr) {
 			t.Fatalf("log contains secret %q", secretStr)
 		}
+	}
+}
+
+func TestChannelExpiredIs410(t *testing.T) {
+	e := newHTTPEnv(t)
+	a := e.session()
+	ch := e.create(a, "h/a")
+	if _, err := e.s.db.Exec("UPDATE channels SET state = 'expired'"); err != nil {
+		t.Fatal(err)
+	}
+	code, body := e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: ch.Handle, Text: "x"})
+	if code != 410 || errCode(body) != protocol.CodeChannelExpire {
+		t.Fatalf("send to expired channel: %d %s", code, body)
+	}
+}
+
+func TestInternalErrorIs500AndHidesDetails(t *testing.T) {
+	e := newHTTPEnv(t)
+	a := e.session()
+	e.s.db.Close() // every store call now fails with a non-*Error
+	code, body := e.do(a, "POST", "/v1/channels", protocol.CreateChannelRequest{Label: "h/a"})
+	if code != 500 && code != 401 {
+		t.Fatalf("got %d %s", code, body)
+	}
+	if code == 500 && (errCode(body) != protocol.CodeInternal || strings.Contains(string(body), "closed")) {
+		t.Fatalf("internal error leaks details: %s", body)
+	}
+	// writeErr with a plain error, directly
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/x", nil)
+	NewServer(e.s, NewTracker(nil), nil).writeErr(rec, req, io.ErrUnexpectedEOF)
+	if rec.Code != 500 || errCode(rec.Body.Bytes()) != protocol.CodeInternal || strings.Contains(rec.Body.String(), "EOF") {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	// a cancelled request writes nothing
+	ctx, cancel := context.WithCancel(bg)
+	cancel()
+	rec = httptest.NewRecorder()
+	NewServer(e.s, NewTracker(nil), nil).writeErr(rec, req.WithContext(ctx), io.ErrUnexpectedEOF)
+	if rec.Body.Len() != 0 {
+		t.Fatalf("wrote %q for a vanished client", rec.Body)
+	}
+}
+
+func TestErrorStringAndHTTPServerTimeouts(t *testing.T) {
+	if got := ErrNoOpen.Error(); got != "no_open_channel: no such open channel" {
+		t.Fatalf("Error() = %q", got)
+	}
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	srv := HTTPServer(":0", http.NewServeMux(), ctx)
+	if srv.ReadHeaderTimeout != 10*time.Second || srv.IdleTimeout == 0 {
+		t.Fatalf("timeouts: header %v idle %v", srv.ReadHeaderTimeout, srv.IdleTimeout)
+	}
+	if srv.WriteTimeout != 0 && srv.WriteTimeout <= protocol.SyncWaitCap {
+		t.Fatalf("WriteTimeout %v would cut long-polls", srv.WriteTimeout)
+	}
+	if srv.BaseContext(nil) != ctx {
+		t.Fatal("BaseContext is not the run context")
+	}
+}
+
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().String()
+}
+
+func TestRunServesAndInitBeforeSweeper(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "run.db")
+	// Seed a live (never disconnected) session, as after a broker restart.
+	seed, err := OpenStore(dbPath, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := seed.CreateSession(bg); err != nil {
+		t.Fatal(err)
+	}
+	seed.Close()
+
+	addr := freeAddr(t)
+	ctx, cancel := context.WithCancel(bg)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{Addr: addr, DBPath: dbPath, SweepInterval: 20 * time.Millisecond,
+			Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	}()
+	var resp *http.Response
+	for i := 0; i < 100; i++ {
+		resp, err = http.Post("http://"+addr+"/v1/sessions", "application/json", strings.NewReader("{}"))
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil || resp.StatusCode != 201 {
+		t.Fatalf("broker not serving: %v %v", err, resp)
+	}
+	resp.Body.Close()
+	time.Sleep(300 * time.Millisecond) // many sweeps
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+	// If the sweeper had run before Init, the seeded session (zero last_seen)
+	// would have been disconnected. Init came first, so it was not.
+	check, err := OpenStore(dbPath, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	var n int
+	check.db.QueryRow("SELECT COUNT(*) FROM sessions WHERE disconnected_at IS NOT NULL").Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d sessions disconnected right after startup", n)
+	}
+}
+
+func TestRunFailsOnBadListenAddress(t *testing.T) {
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	err := Run(bg, Config{Addr: ln.Addr().String(), DBPath: filepath.Join(t.TempDir(), "x.db"),
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err == nil {
+		t.Fatal("Run succeeded on an address already in use")
 	}
 }

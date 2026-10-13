@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -250,21 +251,38 @@ func TestReadZeroNotBlockedByLongWait(t *testing.T) {
 func TestWaitingReadKeepsWaitingWhenAnotherReadTookTheRows(t *testing.T) {
 	_, a, b := linked(t)
 	b.drain()
+	// Park the waiting read right after its wait ends, before it takes the
+	// render mutex, so a real read(0) can take the rows first.
+	woke := make(chan struct{})
+	release := make(chan struct{})
+	var parked atomic.Bool
+	b.tools.afterWait = func() {
+		if parked.CompareAndSwap(false, true) { // only the first (waiting) read parks
+			close(woke)
+			<-release
+		}
+	}
 	long := make(chan string, 1)
 	go func() { text, _ := b.call("read", map[string]any{"wait_seconds": 3}); long <- text }()
 	time.Sleep(300 * time.Millisecond)
-	// Hold the render mutex so the waiting read cannot take the rows first.
-	b.tools.readMu.Lock()
 	a.mustOK("send", map[string]any{"peer": "hostB/bob", "text": "taken elsewhere"})
-	b.eventually(func(s Snapshot) bool { return len(s.Rows) > 0 })
-	rows, gen := b.m.Unread()
-	b.m.Commit(gen, rows[len(rows)-1].ID) // another read consumed them
-	b.tools.readMu.Unlock()
+	select {
+	case <-woke:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting read never woke")
+	}
+	if text := b.mustOK("read", map[string]any{"wait_seconds": 0}); !strings.Contains(text, "taken elsewhere") {
+		t.Fatalf("read(0) did not take the rows: %q", text)
+	}
 	start := time.Now()
+	close(release)
 	select {
 	case text := <-long:
-		if !strings.HasPrefix(text, "No new messages") || time.Since(start) < 1500*time.Millisecond {
-			t.Fatalf("waiting read returned early or wrongly after %v: %q", time.Since(start), text)
+		if !strings.HasPrefix(text, "No new messages") || strings.Contains(text, "taken elsewhere") {
+			t.Fatalf("waiting read returned %q", text)
+		}
+		if time.Since(start) < 1000*time.Millisecond {
+			t.Fatalf("waiting read gave up after %v instead of waiting out its deadline", time.Since(start))
 		}
 	case <-time.After(6 * time.Second):
 		t.Fatal("waiting read never returned")
@@ -482,4 +500,63 @@ func TestClosingTransportMakesPeerReadPeerLeftAtOnce(t *testing.T) {
 	if !strings.Contains(text, `kind="peer_left"`) || strings.Contains(text, "peer_disconnected") {
 		t.Fatalf("peer read: %s", text)
 	}
+}
+
+type fakeWake struct {
+	path  string
+	armed bool
+}
+
+func (f fakeWake) Path() string { return f.path }
+func (f fakeWake) Armed() bool  { return f.armed }
+
+func TestWakeCommandHappyPath(t *testing.T) {
+	tb := newTestBroker(t)
+	a := newShim(t, tb, "hostA")
+	a.tools.wake = fakeWake{path: "/run/user/1000/agent-bus/abc.sock", armed: false}
+	a.tools.SetExecutable(func() (string, error) { return "/nix/store/x-agent-bus/bin/agent-bus", nil })
+	text := a.mustOK("wake_command", nil)
+	want := "/nix/store/x-agent-bus/bin/agent-bus wait --socket /run/user/1000/agent-bus/abc.sock"
+	if !strings.Contains(text, "\n"+want) || !strings.Contains(text, "run_in_background") || !strings.Contains(text, "Wake not armed") {
+		t.Fatalf("not armed: %s", text)
+	}
+	a.tools.wake = fakeWake{path: "/run/user/1000/agent-bus/abc.sock", armed: true}
+	if text := a.mustOK("wake_command", nil); strings.Contains(text, "Wake not armed") || !strings.Contains(text, want) {
+		t.Fatalf("armed: %s", text)
+	}
+	// paths with spaces or quotes are shell-quoted
+	a.tools.SetExecutable(func() (string, error) { return "/opt/my tools/agent-bus", nil })
+	if text := a.mustOK("wake_command", nil); !strings.Contains(text, "'/opt/my tools/agent-bus' wait --socket") {
+		t.Fatalf("quoting: %s", text)
+	}
+	if got := shellQuote("it's"); got != `'it'\''s'` {
+		t.Fatalf("shellQuote = %s", got)
+	}
+	// no wake socket at all
+	a.tools.wake = nil
+	if text, isErr := a.call("wake_command", nil); !isErr || !strings.Contains(text, "not available") {
+		t.Fatalf("no socket: %v %s", isErr, text)
+	}
+	if tb.totalHits() != 0 {
+		t.Fatal("wake_command contacted the broker")
+	}
+}
+
+func TestSendErrorsRenderedForTheAgent(t *testing.T) {
+	_, a, b := linked(t)
+	_ = b
+	text, isErr := a.call("send", map[string]any{"peer": "hostZ/nobody", "text": "x"})
+	if !isErr || !strings.Contains(text, "Known peers: hostB/bob [handle ch-") || !strings.Contains(text, "connected]") {
+		t.Fatalf("unknown peer: %v %s", isErr, text)
+	}
+	text, isErr = a.call("send", map[string]any{"peer": "hostB/bob", "text": ""})
+	if !isErr || !strings.Contains(text, "empty") {
+		t.Fatalf("empty: %v %s", isErr, text)
+	}
+	text, isErr = a.call("send", map[string]any{"peer": "hostB/bob", "text": strings.Repeat("x", protocol.MaxMessageBytes+1)})
+	if !isErr || !strings.Contains(text, "65536") || !strings.Contains(text, "limit") {
+		t.Fatalf("too large: %v %s", isErr, text)
+	}
+	// the exact limit still goes through
+	a.mustOK("send", map[string]any{"peer": "hostB/bob", "text": strings.Repeat("x", protocol.MaxMessageBytes)})
 }

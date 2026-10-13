@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -314,5 +315,33 @@ func TestPeerStateMatchesLastEvent(t *testing.T) {
 	}
 	if last() != protocol.KindPeerLeft || e.state(b) != protocol.StatePeerLeft {
 		t.Fatalf("after leave: %s / %s", last(), e.state(b))
+	}
+}
+
+func TestSweeperRunSweepsOnItsInterval(t *testing.T) {
+	e := newSweepEnv(t)
+	c := e.session()
+	e.clk.Advance(protocol.DisconnectAfter + time.Second)
+	e.sw.Interval = 10 * time.Millisecond
+	ctx, cancel := context.WithCancel(bg)
+	done := make(chan struct{})
+	go func() { e.sw.Run(ctx); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var disc *int64
+		e.s.db.QueryRow("SELECT disconnected_at FROM sessions WHERE id = ?", c).Scan(&disc)
+		if disc != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Run never swept")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop on cancel")
 	}
 }

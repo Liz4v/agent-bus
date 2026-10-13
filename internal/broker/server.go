@@ -261,6 +261,8 @@ type Config struct {
 	Addr   string
 	DBPath string
 	Log    *slog.Logger
+	// SweepInterval overrides the sweeper period (default protocol.SweepInterval).
+	SweepInterval time.Duration
 }
 
 // Run opens the store, initialises liveness tracking, starts the sweeper and
@@ -281,6 +283,9 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	sweeper := NewSweeper(store, tracker, log)
+	if cfg.SweepInterval > 0 {
+		sweeper.Interval = cfg.SweepInterval
+	}
 	sweepDone := make(chan struct{})
 	sweepCtx, stopSweep := context.WithCancel(ctx)
 	go func() { defer close(sweepDone); sweeper.Run(sweepCtx) }()

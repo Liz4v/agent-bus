@@ -108,7 +108,9 @@ func runShim(ctx context.Context, args []string, stderr io.Writer) int {
 	sess := shim.NewSession(c)
 	mirror := shim.NewMirror(sess, shim.MirrorConfig{})
 	var wakeInfo shim.WakeInfo // stays a true nil interface if the socket cannot start
-	if w, err := shim.StartWake(mirror, sess, shim.WakeOptions{Log: log}); err != nil {
+	wakeOpt := shim.WakeOptionsFromEnv()
+	wakeOpt.Log = log
+	if w, err := shim.StartWake(mirror, sess, wakeOpt); err != nil {
 		log.Warn("running without a wake socket", "err", err)
 	} else {
 		defer w.Close()

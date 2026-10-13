@@ -35,6 +35,7 @@ type Tools struct {
 	maxWait time.Duration
 
 	beforeCommit func() // test hook: runs between rendering and the commit check
+	afterWait    func() // test hook: runs after a read's wait ends, before it takes the render mutex
 }
 
 // NewTools builds the tool set. wake may be nil.
@@ -283,6 +284,9 @@ func (t *Tools) read(ctx context.Context, _ *mcp.CallToolRequest, in readArgs) (
 			}
 		}
 		// 3. render and 4. commit, under the mutex.
+		if t.afterWait != nil {
+			t.afterWait()
+		}
 		t.readMu.Lock()
 		rows, gen := t.m.Unread()
 		if len(rows) == 0 {

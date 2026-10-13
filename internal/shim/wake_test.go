@@ -3,8 +3,11 @@ package shim
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -383,5 +386,29 @@ func TestClientsGetEOFOnShutdown(t *testing.T) {
 		t.Fatalf("got %q, want EOF", line)
 	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatal("client was not disconnected on shutdown")
+	}
+}
+
+func TestWakeOptionsFromEnvHonoursXDGRuntimeDir(t *testing.T) {
+	rt := shortTempDir(t)
+	t.Setenv("XDG_RUNTIME_DIR", rt)
+	opt := WakeOptionsFromEnv()
+	if opt.RuntimeDir != rt {
+		t.Fatalf("RuntimeDir = %q, want %q", opt.RuntimeDir, rt)
+	}
+	me := newMirrorEnv(t, fastCfg())
+	w, err := StartWake(me.m, me.sess, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if want := filepath.Join(rt, "agent-bus") + string(os.PathSeparator); !strings.HasPrefix(w.Path(), want) {
+		t.Fatalf("socket %q is not under %s", w.Path(), want)
+	}
+	// without it, the fallback is os.TempDir()/agent-bus-<uid>
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	got := WakeDir(WakeOptionsFromEnv().withDefaults())
+	if want := filepath.Join(os.TempDir(), fmt.Sprintf("agent-bus-%d", os.Getuid())); got != want {
+		t.Fatalf("fallback dir %q, want %q", got, want)
 	}
 }

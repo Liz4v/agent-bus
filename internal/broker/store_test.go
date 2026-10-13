@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -441,5 +442,51 @@ func TestInboxRowsOutliveMembershipAndChannel(t *testing.T) {
 	}
 	if !found[protocol.KindText] || !found[protocol.KindPeerLeft] {
 		t.Fatalf("inbox rows lost with the channel: %v", texts)
+	}
+}
+
+func TestDSNPragmasOnEveryPooledConnection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pragmas.db")
+	s, err := OpenStore(path, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	var conns []*sql.Conn
+	for i := 0; i < 4; i++ {
+		c, err := s.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+		var fk, busy int
+		var mode string
+		c.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk)
+		c.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busy)
+		c.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&mode)
+		if fk != 1 || busy != 5000 || mode != "wal" {
+			t.Fatalf("conn %d: foreign_keys=%d busy_timeout=%d journal_mode=%s", i, fk, busy, mode)
+		}
+	}
+	for _, c := range conns {
+		c.Close()
+	}
+
+	// _txlock=immediate: a transaction takes the write lock at BEGIN, so a
+	// second writer with no busy timeout is refused at once. A deferred
+	// transaction would not hold the lock yet.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	other, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if _, err := other.ExecContext(ctx, "BEGIN IMMEDIATE"); err == nil {
+		t.Fatal("second writer got the lock: transactions are not immediate")
 	}
 }

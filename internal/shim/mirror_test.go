@@ -2,10 +2,15 @@ package shim
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Liz4v/agent-bus/internal/client"
 	"github.com/Liz4v/agent-bus/internal/protocol"
 )
 
@@ -284,12 +289,60 @@ func TestNewLoopStartsFromZeroAndSeesLeaveQuickly(t *testing.T) {
 	}
 }
 
-func TestStaleRowsNotAppended(t *testing.T) {
-	m := &Mirror{changed: make(chan struct{})}
-	m.after = 10
-	m.applyLocked(protocol.SyncResponse{Version: 3, Messages: []protocol.Message{{ID: 5}, {ID: 10}, {ID: 11}}})
-	if len(m.rows) != 1 || m.rows[0].ID != 11 || m.after != 11 || m.version != 3 {
-		t.Fatalf("rows %+v after %d", m.rows, m.after)
+// scriptedBroker serves registration and then a fixed sequence of sync
+// responses; after the script runs out it holds the connection open.
+func scriptedBroker(t *testing.T, script []protocol.SyncResponse) *Session {
+	t.Helper()
+	var mu sync.Mutex
+	next := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sessions":
+			w.WriteHeader(201)
+			w.Write([]byte(`{"session_token":"tok"}`))
+		case "/v1/sync":
+			mu.Lock()
+			i := next
+			next++
+			mu.Unlock()
+			if i >= len(script) {
+				select {
+				case <-r.Context().Done():
+				case <-time.After(5 * time.Second):
+				}
+				return
+			}
+			json.NewEncoder(w).Encode(script[i])
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return NewSession(client.New(ts.URL))
+}
+
+func TestStaleResponseRowsNotAppended(t *testing.T) {
+	row := func(id int64, text string) protocol.Message {
+		return protocol.Message{ID: id, Handle: "ch-1", Kind: protocol.KindText, Text: text}
+	}
+	sess := scriptedBroker(t, []protocol.SyncResponse{
+		{Version: 1, Messages: []protocol.Message{row(1, "one"), row(2, "two")}},
+		{Version: 2, Messages: []protocol.Message{row(2, "stale duplicate"), row(1, "stale again")}}, // rows <= after
+		{Version: 3, Messages: []protocol.Message{row(3, "three")}},
+	})
+	m := NewMirror(sess, MirrorConfig{SyncWait: time.Second, BackoffMin: 10 * time.Millisecond})
+	defer m.Stop()
+	if _, err := sess.Ensure(bg); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+	defer cancel()
+	s, err := m.WaitChange(ctx, func(s Snapshot) bool { return len(s.Rows) == 3 })
+	if err != nil {
+		t.Fatalf("rows: %+v", s.Rows)
+	}
+	for i, want := range []string{"one", "two", "three"} {
+		if s.Rows[i].Text != want {
+			t.Fatalf("row %d = %q, want %q (stale rows were appended?)", i, s.Rows[i].Text, want)
+		}
 	}
 }
 
@@ -354,7 +407,7 @@ func TestMorePagingFetchesEverything(t *testing.T) {
 	e.eventually(func(s Snapshot) bool { return rowsWithKind(s, protocol.KindText) == n })
 }
 
-func TestSyncAtLeastEveryInterval(t *testing.T) {
+func TestSyncAtLeastEveryIntervalKeepsSessionConnected(t *testing.T) {
 	e := newMirrorEnv(t, MirrorConfig{SyncWait: time.Second, BackoffMin: 20 * time.Millisecond})
 	e.link()
 	before := e.tb.hitCount("POST /v1/sync")
@@ -362,4 +415,33 @@ func TestSyncAtLeastEveryInterval(t *testing.T) {
 	if got := e.tb.hitCount("POST /v1/sync") - before; got < 3 {
 		t.Fatalf("only %d syncs in 3.5 s with a 1 s wait", got)
 	}
+	// Two minutes of (fake) idle time: only the sync loop can keep the shim's
+	// session seen. The peer does a request of its own, like a live peer would.
+	e.tb.clk.Advance(2 * protocol.DisconnectAfter)
+	deadline := time.Now().Add(5 * time.Second)
+	for e.tb.tracker.Get(mustSessionID(t, e)).Before(e.tb.clk.Now()) {
+		if time.Now().After(deadline) {
+			t.Fatal("the sync loop did not touch the session after the clock moved")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := e.tb.c.Sync(bg, e.peerTok, protocol.SyncRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.tb.sweeper.Sweep(bg); err != nil {
+		t.Fatal(err)
+	}
+	r, err := e.tb.c.Sync(bg, e.peerTok, protocol.SyncRequest{})
+	if err != nil || len(r.Channels) != 1 || r.Channels[0].State != protocol.StateConnected {
+		t.Fatalf("shim's session not connected: %+v %v", r.Channels, err)
+	}
+}
+
+func mustSessionID(t *testing.T, e *mirrorEnv) int64 {
+	t.Helper()
+	id, err := e.tb.store.SessionByToken(bg, e.sess.Token())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
