@@ -1,0 +1,17 @@
+[Unit]
+Description=agent-bus broker (cross-host peer channels for Claude Code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/agent-bus broker --listen :7700
+DynamicUser=yes
+StateDirectory=agent-bus
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

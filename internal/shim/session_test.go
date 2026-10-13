@@ -1,0 +1,285 @@
+package shim
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/Liz4v/agent-bus/internal/broker"
+	"github.com/Liz4v/agent-bus/internal/client"
+	"github.com/Liz4v/agent-bus/internal/protocol"
+)
+
+var bg = context.Background()
+
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+// testBroker is an in-process broker that can be switched off and counts requests.
+type testBroker struct {
+	t            *testing.T
+	store        *broker.Store
+	ts           *httptest.Server
+	c            *client.Client
+	down         atomic.Bool
+	failChannels atomic.Int32 // number of upcoming /v1/channels requests to drop
+	delay        atomic.Int64 // nanoseconds slept after each /v1/sync is handled, before the handler returns
+
+	clk     *fakeClock
+	tracker *broker.Tracker
+	sweeper *broker.Sweeper
+
+	mu   sync.Mutex
+	hits map[string]int
+}
+
+func newTestBroker(t *testing.T) *testBroker {
+	t.Helper()
+	clk := &fakeClock{t: time.Now()}
+	store, err := broker.OpenStore(filepath.Join(t.TempDir(), "shim.db"), nil, clk.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tracker := broker.NewTracker(clk.Now)
+	tb := &testBroker{t: t, store: store, hits: map[string]int{}, clk: clk, tracker: tracker,
+		sweeper: broker.NewSweeper(store, tracker, quiet)}
+	inner := broker.NewServer(store, tracker, quiet).Handler()
+	tb.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if tb.down.Load() {
+			panic(http.ErrAbortHandler) // drops the connection
+		}
+		if r.URL.Path == "/v1/channels" && tb.failChannels.Add(-1) >= 0 {
+			panic(http.ErrAbortHandler)
+		} else if r.URL.Path == "/v1/channels" {
+			tb.failChannels.Store(0)
+		}
+		tb.mu.Lock()
+		tb.hits[r.Method+" "+r.URL.Path]++
+		tb.mu.Unlock()
+		inner.ServeHTTP(w, r)
+		if d := time.Duration(tb.delay.Load()); d > 0 && r.URL.Path == "/v1/sync" {
+			time.Sleep(d)
+		}
+	}))
+	tb.c = client.New(tb.ts.URL)
+	t.Cleanup(func() { tb.ts.Close(); store.Close() })
+	return tb
+}
+
+func (tb *testBroker) hitCount(key string) int {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.hits[key]
+}
+
+func (tb *testBroker) totalHits() int {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	n := 0
+	for _, v := range tb.hits {
+		n += v
+	}
+	return n
+}
+
+func (tb *testBroker) sessions() int { return tb.hitCount("POST /v1/sessions") }
+
+// kill deletes a session on the broker side, as a reap would, so the next
+// request carrying its token gets 401.
+func (tb *testBroker) kill(token string) {
+	tb.t.Helper()
+	id, err := tb.store.SessionByToken(bg, token)
+	if err != nil {
+		tb.t.Fatal(err)
+	}
+	if err := tb.store.DeleteSelf(bg, id); err != nil {
+		tb.t.Fatal(err)
+	}
+}
+
+func TestEnsureRegistersOnceUnderConcurrency(t *testing.T) {
+	tb := newTestBroker(t)
+	s := NewSession(tb.c)
+	var registered atomic.Int32
+	s.SetCallbacks(func() { registered.Add(1) }, nil, nil)
+	var wg sync.WaitGroup
+	toks := make([]string, 12)
+	for i := range toks {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var err error
+			if toks[i], err = s.Ensure(bg); err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if tb.sessions() != 1 || registered.Load() != 1 {
+		t.Fatalf("sessions=%d onRegister=%d", tb.sessions(), registered.Load())
+	}
+	for _, tk := range toks {
+		if tk != toks[0] || tk == "" {
+			t.Fatal("callers got different tokens")
+		}
+	}
+}
+
+func TestConcurrentDropClearsOnceAndSetsNoticeOnce(t *testing.T) {
+	tb := newTestBroker(t)
+	s := NewSession(tb.c)
+	var drops atomic.Int32
+	s.SetCallbacks(nil, func() DropReport {
+		drops.Add(1)
+		return DropReport{HadState: true, UnreadCount: 2, UnreadLabels: []string{"h/a", "h/a"}}
+	}, nil)
+	tok, _ := s.Ensure(bg)
+	var wg sync.WaitGroup
+	var won atomic.Int32
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if s.Drop(tok) {
+				won.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if won.Load() != 1 || drops.Load() != 1 || s.Token() != "" {
+		t.Fatalf("won=%d drops=%d token=%q", won.Load(), drops.Load(), s.Token())
+	}
+	n := s.TakeNotice()
+	if !strings.Contains(n, "expired") || !strings.Contains(n, "2 unread") || !strings.Contains(n, "h/a") ||
+		strings.Count(n, "h/a") != 1 {
+		t.Fatalf("notice: %q", n)
+	}
+	if s.TakeNotice() != "" {
+		t.Fatal("notice not consumed")
+	}
+}
+
+func TestDropWithoutStateSetsNoNotice(t *testing.T) {
+	tb := newTestBroker(t)
+	s := NewSession(tb.c)
+	s.SetCallbacks(nil, func() DropReport { return DropReport{} }, nil)
+	tok, _ := s.Ensure(bg)
+	if !s.Drop(tok) {
+		t.Fatal("drop did nothing")
+	}
+	if s.PeekNotice() != "" {
+		t.Fatal("notice set for a session that never had state")
+	}
+}
+
+func TestPeekNoticeDoesNotConsume(t *testing.T) {
+	tb := newTestBroker(t)
+	s := NewSession(tb.c)
+	s.SetCallbacks(nil, func() DropReport { return DropReport{HadState: true} }, nil)
+	tok, _ := s.Ensure(bg)
+	s.Drop(tok)
+	a, b := s.PeekNotice(), s.PeekNotice()
+	if a == "" || a != b {
+		t.Fatal("peek consumed the notice")
+	}
+	if s.TakeNotice() != a || s.PeekNotice() != "" {
+		t.Fatal("take did not consume")
+	}
+}
+
+func TestDropWithOldTokenAfterNewRegistrationDoesNothing(t *testing.T) {
+	tb := newTestBroker(t)
+	s := NewSession(tb.c)
+	var drops atomic.Int32
+	s.SetCallbacks(nil, func() DropReport { drops.Add(1); return DropReport{HadState: true} }, nil)
+	old, _ := s.Ensure(bg)
+	s.Drop(old)
+	s.TakeNotice()
+	fresh, _ := s.Ensure(bg)
+	if fresh == old {
+		t.Fatal("same token")
+	}
+	if s.Drop(old) || drops.Load() != 1 || s.Token() != fresh || s.PeekNotice() != "" {
+		t.Fatal("stale drop affected the new session")
+	}
+}
+
+func TestCloseMakesPeerReadPeerLeftImmediately(t *testing.T) {
+	tb := newTestBroker(t)
+	s := NewSession(tb.c)
+	tokA, _ := s.Ensure(bg)
+	tokB, _ := tb.c.CreateSession(bg)
+	ch, err := tb.c.CreateChannel(bg, tokA, "h/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tb.c.JoinChannel(bg, tokB, ch.ChannelID, "h/b"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close(bg)
+	r, err := tb.c.Sync(bg, tokB, protocol.SyncRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Messages) != 1 || r.Messages[0].Kind != protocol.KindPeerLeft || r.Channels[0].State != protocol.StatePeerLeft {
+		t.Fatalf("peer saw %+v", r)
+	}
+	if s.Token() != "" {
+		t.Fatal("token kept after close")
+	}
+}
+
+func TestCloseUnreachableBrokerReturnsQuickly(t *testing.T) {
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			w.WriteHeader(201)
+			w.Write([]byte(`{"session_token":"tok"}`))
+			return
+		}
+		<-release // DELETE hangs
+	}))
+	defer ts.Close()
+	defer close(release)
+	s := NewSession(client.New(ts.URL))
+	if _, err := s.Ensure(bg); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	s.Close(bg)
+	if d := time.Since(start); d > 4*time.Second || d < time.Second {
+		t.Fatalf("Close took %v, want about 2s", d)
+	}
+}
+
+func TestCloseWithNoTokenMakesNoRequest(t *testing.T) {
+	tb := newTestBroker(t)
+	s := NewSession(tb.c)
+	s.Close(bg)
+	if tb.totalHits() != 0 {
+		t.Fatalf("%d requests made", tb.totalHits())
+	}
+}
