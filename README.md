@@ -103,4 +103,4 @@ make test      # go test -race -cover ./... (needs a C compiler for the race det
 make build     # dist/agent-bus
 ```
 
-The design, decisions and test plan are in `specs/agent-bus-v1/`.
+The design, decisions and test plan are in `specs/archive/2026-10-13-agent-bus-v1/`.
