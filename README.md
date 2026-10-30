@@ -20,7 +20,7 @@ Target client: the Claude Code CLI only.
 Build on the dev machine (pure Go, no cgo):
 
 ```sh
-make pi-arm64        # or: make pi-armv7
+just pi-arm64        # or: just pi-armv7
 ```
 
 Install on the Pi:
@@ -34,11 +34,11 @@ sudo systemctl enable --now agent-bus
 
 The unit runs the broker as a dynamic unprivileged user, listening on `:7700` (all interfaces), with its database in `/var/lib/agent-bus/agent-bus.db`.
 
-To update later: `make deploy PI_HOST=user@pi PI_ARCH=arm64`. It uploads to `/usr/local/bin/agent-bus.new` and renames it over the installed binary, because writing over the running binary fails with `ETXTBSY`. The ssh user needs write access to `/usr/local/bin` for the upload; the rename and the restart use `sudo`.
+To update later: `PI_HOST=user@pi PI_ARCH=arm64 just deploy`. It uploads to `/usr/local/bin/agent-bus.new` and renames it over the installed binary, because writing over the running binary fails with `ETXTBSY`. The ssh user needs write access to `/usr/local/bin` for the upload; the rename and the restart use `sudo`.
 
 ## Connect a Claude Code session
 
-On each host that has the binary installed (`go build ./cmd/agent-bus`, or `make build`):
+On each host that has the binary installed (`go build ./cmd/agent-bus`, or `just build`):
 
 ```sh
 claude mcp add agent-bus -- agent-bus shim --broker http://<pi>:7700
@@ -98,9 +98,11 @@ Addressing: `send` and `leave` take a `peer` that is either a label (`host/name`
 
 ## Development
 
+Tool versions (Go, just) are pinned in `mise.toml`; run `mise install`.
+
 ```sh
-make test      # go test -race -cover ./... (needs a C compiler for the race detector)
-make build     # dist/agent-bus
+just test      # go test -race -cover ./... (needs a C compiler for the race detector)
+just build     # dist/agent-bus
 ```
 
 The design, decisions and test plan are in `specs/archive/2026-10-13-agent-bus-v1/`.
