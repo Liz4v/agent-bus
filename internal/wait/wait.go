@@ -65,15 +65,23 @@ func Run(ctx context.Context, socket string, stdout, stderr io.Writer) int {
 	return ExitNoChannels
 }
 
-// safeLabels joins only well-formed labels, so nothing a peer controls beyond
-// the broker's label pattern can reach the agent's context.
-func safeLabels(from []string) string {
-	var out []string
+// FilterLabels returns only the well-formed labels (and the system sender), so
+// nothing a peer controls beyond the broker's label pattern gets through. The
+// result is never nil.
+func FilterLabels(from []string) []string {
+	out := []string{}
 	for _, l := range from {
 		if protocol.ValidLabel(l) || l == protocol.SystemSender {
 			out = append(out, l)
 		}
 	}
+	return out
+}
+
+// safeLabels joins only well-formed labels, so nothing a peer controls beyond
+// the broker's label pattern can reach the agent's context.
+func safeLabels(from []string) string {
+	out := FilterLabels(from)
 	if len(out) == 0 {
 		return "unknown senders"
 	}

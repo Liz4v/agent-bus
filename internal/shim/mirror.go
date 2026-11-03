@@ -37,6 +37,7 @@ type Snapshot struct {
 	Rows     []protocol.Message // unread rows, id > cursor, in ID order
 	Channels []protocol.Channel
 	Health   error
+	Cursor   int64 // read cursor, taken under the same lock as Rows
 }
 
 // Summary is the wake-socket view of the mirror (D7).
@@ -45,6 +46,7 @@ type Summary struct {
 	From         []string // sender labels of those rows, de-duplicated
 	LiveChannels int      // channels in state waiting, connected or peer_disconnected
 	Health       error
+	Cursor       int64 // read cursor; changes after a read
 }
 
 type refreshWaiter struct{ done chan error }
@@ -191,6 +193,7 @@ func (m *Mirror) Snapshot() Snapshot {
 		Rows:     append([]protocol.Message(nil), m.rows...),
 		Channels: append([]protocol.Channel(nil), m.channels...),
 		Health:   m.health,
+		Cursor:   m.cursor,
 	}
 }
 
@@ -222,6 +225,7 @@ func (m *Mirror) Summary() Summary {
 		}
 	}
 	sum.Health = s.Health
+	sum.Cursor = s.Cursor
 	return sum
 }
 

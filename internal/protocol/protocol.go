@@ -200,4 +200,5 @@ type StatusReply struct {
 	LiveChannels int      `json:"live_channels"`
 	Armed        bool     `json:"armed"`
 	Error        *string  `json:"error"`
+	Cursor       int64    `json:"cursor"` // read cursor; changes after a read (additive)
 }

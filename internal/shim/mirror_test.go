@@ -445,3 +445,24 @@ func mustSessionID(t *testing.T, e *mirrorEnv) int64 {
 	}
 	return id
 }
+
+func TestSummaryCursor(t *testing.T) {
+	e := newMirrorEnv(t, fastCfg())
+	if c := e.m.Summary().Cursor; c != 0 {
+		t.Fatalf("initial cursor %d", c)
+	}
+	e.link()
+	e.peerSend("one")
+	s := e.eventually(func(s Snapshot) bool { return rowsWithKind(s, protocol.KindText) == 1 })
+	maxID := s.Rows[len(s.Rows)-1].ID
+	e.m.Commit(s.Gen, maxID)
+	sum := e.m.Summary()
+	if sum.Cursor != maxID || sum.Count != 0 {
+		t.Fatalf("after commit: cursor %d (want %d), count %d", sum.Cursor, maxID, sum.Count)
+	}
+	e.tb.kill(e.sess.Token())
+	e.m.Refresh(bg)
+	if c := e.m.Summary().Cursor; c != 0 {
+		t.Fatalf("cursor %d after session reset", c)
+	}
+}

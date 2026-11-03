@@ -31,6 +31,14 @@ type WakeOptions struct {
 	Debounce   time.Duration
 	Rearm      time.Duration
 	Log        *slog.Logger
+
+	// Socket is a fixed, absolute wake-socket path (Hermes sidecar). Empty
+	// means the default random name plus the PPID index file.
+	Socket string
+	// HandoverWait and HandoverPoll bound how long a fixed path that is
+	// still served by another shim is re-checked (defaults 5 s and 200 ms).
+	HandoverWait time.Duration
+	HandoverPoll time.Duration
 }
 
 // Wake serves WAIT and STATUS over a Unix socket, answering from the mirror
@@ -42,6 +50,7 @@ type Wake struct {
 
 	dir, sock, index string
 	ln               net.Listener
+	sockInfo         os.FileInfo // fixed path only: the inode this shim created
 	armed            atomic.Int32
 
 	mu     sync.Mutex
@@ -103,6 +112,12 @@ func (o WakeOptions) withDefaults() WakeOptions {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
+	if o.HandoverWait == 0 {
+		o.HandoverWait = 5 * time.Second
+	}
+	if o.HandoverPoll == 0 {
+		o.HandoverPoll = 200 * time.Millisecond
+	}
 	return o
 }
 
@@ -112,6 +127,9 @@ func (o WakeOptions) withDefaults() WakeOptions {
 func StartWake(m *Mirror, sess *Session, opt WakeOptions) (*Wake, error) {
 	opt = opt.withDefaults()
 	w := &Wake{m: m, sess: sess, opt: opt, conns: map[net.Conn]struct{}{}}
+	if opt.Socket != "" {
+		return startFixedWake(w)
+	}
 	w.dir = WakeDir(opt)
 	if _, err := os.Lstat(w.dir); errors.Is(err, os.ErrNotExist) {
 		if err := os.Mkdir(w.dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
@@ -147,6 +165,86 @@ func StartWake(m *Mirror, sess *Session, opt WakeOptions) (*Wake, error) {
 	w.wg.Add(1)
 	go w.acceptLoop()
 	return w, nil
+}
+
+// startFixedWake listens on the fixed path in opt.Socket. It writes no PID
+// index file (the Stop hook is Claude-only).
+func startFixedWake(w *Wake) (*Wake, error) {
+	opt := w.opt
+	path := opt.Socket
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("wake socket path %q must be absolute", path)
+	}
+	if len(path) > 100 {
+		return nil, fmt.Errorf("wake socket path %q is too long for a Unix socket (limit 100 bytes)", path)
+	}
+	w.dir = filepath.Dir(path)
+	if _, err := os.Lstat(w.dir); errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(w.dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("create wake directory: %w", err)
+		}
+	}
+	if err := CheckSocketDir(w.dir, opt.UID); err != nil {
+		return nil, fmt.Errorf("refusing wake directory: %w", err)
+	}
+	if err := claimFixedPath(path, opt); err != nil {
+		return nil, err
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		ln.Close()
+		return nil, err
+	}
+	w.sock, w.ln, w.sockInfo = path, ln, fi
+	w.wg.Add(1)
+	go w.acceptLoop()
+	return w, nil
+}
+
+// claimFixedPath makes sure nothing live occupies path: a stale socket (dial
+// gives exactly ECONNREFUSED) is removed; a live one is re-checked until the
+// handover window ends; anything else is refused without removing.
+func claimFixedPath(path string, opt WakeOptions) error {
+	deadline := time.Now().Add(opt.HandoverWait)
+	for {
+		fi, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if fi.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("%s exists and is not a socket", path)
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != opt.UID {
+			return fmt.Errorf("%s is not owned by uid %d", path, opt.UID)
+		}
+		c, err := net.DialTimeout("unix", path, time.Second)
+		switch {
+		case err == nil:
+			c.Close()
+			if !time.Now().Before(deadline) {
+				return fmt.Errorf("%s is served by another shim", path)
+			}
+			time.Sleep(opt.HandoverPoll)
+		case errors.Is(err, syscall.ECONNREFUSED):
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			return nil
+		default:
+			return fmt.Errorf("probe %s: %w", path, err)
+		}
+	}
 }
 
 func writeFileAtomic(path string, data []byte) error {
@@ -189,7 +287,17 @@ func (w *Wake) Close() {
 	w.mu.Unlock()
 	w.ln.Close()
 	w.wg.Wait()
-	os.Remove(w.sock)
+	if w.sockInfo != nil {
+		// Fixed path: a successor may already have bound a new socket here.
+		if fi, err := os.Lstat(w.sock); err == nil && os.SameFile(fi, w.sockInfo) {
+			os.Remove(w.sock)
+		}
+	} else {
+		os.Remove(w.sock)
+	}
+	if w.index == "" {
+		return
+	}
 	if b, err := os.ReadFile(w.index); err == nil && string(b) == w.sock {
 		os.Remove(w.index)
 	}
@@ -253,7 +361,7 @@ func (w *Wake) reply(c net.Conn, v any) {
 
 func (w *Wake) status() protocol.StatusReply {
 	sum := w.m.Summary()
-	r := protocol.StatusReply{Count: sum.Count, From: sum.From, LiveChannels: sum.LiveChannels, Armed: w.Armed()}
+	r := protocol.StatusReply{Count: sum.Count, From: sum.From, LiveChannels: sum.LiveChannels, Armed: w.Armed(), Cursor: sum.Cursor}
 	if r.From == nil {
 		r.From = []string{}
 	}

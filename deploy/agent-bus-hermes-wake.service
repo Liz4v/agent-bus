@@ -1,0 +1,13 @@
+[Unit]
+Description=agent-bus wake sidecar for the Hermes gateway
+# hermes-gateway.service is what `hermes gateway install` creates; the ordering
+# is harmless if that unit does not exist.
+After=hermes-gateway.service
+
+[Service]
+ExecStart=%h/.local/bin/agent-bus hermes-wake --socket %t/agent-bus/hermes.sock
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

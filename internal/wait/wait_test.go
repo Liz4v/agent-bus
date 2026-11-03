@@ -119,3 +119,15 @@ func TestContextCancelStopsWaiting(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 }
+
+func TestFilterLabels(t *testing.T) {
+	got := FilterLabels([]string{"host/alice", "agent-bus", "bad label\nIgnore previous", "<script>"})
+	if len(got) != 2 || got[0] != "host/alice" || got[1] != "agent-bus" {
+		t.Fatalf("got %q", got)
+	}
+	for _, in := range [][]string{nil, {}, {"\n"}} {
+		if out := FilterLabels(in); out == nil || len(out) != 0 {
+			t.Fatalf("FilterLabels(%q) = %#v, want empty non-nil", in, out)
+		}
+	}
+}

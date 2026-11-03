@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -17,6 +18,7 @@ import (
 
 	"github.com/Liz4v/agent-bus/internal/broker"
 	"github.com/Liz4v/agent-bus/internal/client"
+	"github.com/Liz4v/agent-bus/internal/hermeswake"
 	"github.com/Liz4v/agent-bus/internal/hook"
 	"github.com/Liz4v/agent-bus/internal/shim"
 	"github.com/Liz4v/agent-bus/internal/wait"
@@ -30,6 +32,8 @@ commands:
   broker      run the broker (on the Pi):   --listen :7700 --db /var/lib/agent-bus/agent-bus.db
   shim        run the MCP shim (stdio):     --broker http://host:7700  (or AGENT_BUS_URL)
   wait        block until messages wait:    --socket <path from the wake_command tool>
+  hermes-wake wake a Hermes gateway:        --socket <path> --url <webhook> --secret-file <file>
+              (shim side: shim --wake-socket <path>; both default to AGENT_BUS_WAKE_SOCKET)
   hook stop   Claude Code Stop hook (reads the hook JSON on stdin)
   version     print the version
 `
@@ -52,6 +56,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runShim(ctx, args[1:], stderr)
 	case "wait":
 		return runWait(ctx, args[1:], stdout, stderr)
+	case "hermes-wake":
+		return runHermesWake(ctx, args[1:], stderr)
 	case "hook":
 		if len(args) == 2 && args[1] == "stop" {
 			env := hook.DefaultEnv()
@@ -90,6 +96,7 @@ func runBroker(ctx context.Context, args []string, stderr io.Writer) int {
 func runShim(ctx context.Context, args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("shim", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	wakeSocket := fs.String("wake-socket", os.Getenv("AGENT_BUS_WAKE_SOCKET"), "fixed wake socket path (or AGENT_BUS_WAKE_SOCKET); for the Hermes sidecar")
 	brokerURL := fs.String("broker", os.Getenv("AGENT_BUS_URL"), "broker URL, for example http://pi:7700 (or set AGENT_BUS_URL)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -110,6 +117,7 @@ func runShim(ctx context.Context, args []string, stderr io.Writer) int {
 	var wakeInfo shim.WakeInfo // stays a true nil interface if the socket cannot start
 	wakeOpt := shim.WakeOptionsFromEnv()
 	wakeOpt.Log = log
+	wakeOpt.Socket = *wakeSocket
 	if w, err := shim.StartWake(mirror, sess, wakeOpt); err != nil {
 		log.Warn("running without a wake socket", "err", err)
 	} else {
@@ -137,4 +145,36 @@ func runWait(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	return wait.Run(ctx, *socket, stdout, stderr)
+}
+
+func runHermesWake(ctx context.Context, args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("hermes-wake", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	socket := fs.String("socket", os.Getenv("AGENT_BUS_WAKE_SOCKET"), "shim wake socket path (or AGENT_BUS_WAKE_SOCKET)")
+	url := fs.String("url", "http://127.0.0.1:8644/webhooks/agent-bus", "Hermes webhook route URL")
+	home, _ := os.UserHomeDir()
+	secretFile := fs.String("secret-file", filepath.Join(home, ".config", "agent-bus", "hermes-webhook-secret"), "file holding the webhook secret (mode 0600)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *socket == "" {
+		fmt.Fprintln(stderr, "agent-bus hermes-wake: no wake socket; pass --socket or set AGENT_BUS_WAKE_SOCKET")
+		return 2
+	}
+	secret, err := hermeswake.LoadSecret(*secretFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "agent-bus hermes-wake: %v\n", err)
+		return 2
+	}
+	log := slog.New(slog.NewTextHandler(stderr, nil))
+	err = hermeswake.Run(ctx, hermeswake.Config{
+		Shim:     hermeswake.SocketShim{Path: *socket},
+		Notifier: &hermeswake.Poster{URL: *url, Secret: secret},
+		Log:      log,
+	})
+	if err != nil && ctx.Err() == nil {
+		fmt.Fprintf(stderr, "agent-bus hermes-wake: %v\n", err)
+		return 1
+	}
+	return 0
 }
