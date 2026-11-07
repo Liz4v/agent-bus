@@ -152,28 +152,65 @@ type resolved struct {
 	state string
 }
 
-// resolve finds the membership that `to` (a handle, or a label if it contains
-// '/') names, inside the caller's session (D4).
+// resolve finds the membership that `to` names, inside the caller's session
+// (D4). `to` is a full label (contains '/'), a channel handle, or a bare peer
+// name (the part of the label after the host).
 func (tx *Tx) resolve(session int64, to string) (resolved, error) {
-	var r resolved
-	var row *sql.Row
-	if strings.Contains(to, "/") {
-		row = tx.QueryRowContext(tx.ctx, `
-SELECT m.id, m.channel_id, m.session_id, m.label, m.handle, c.state
-FROM members m JOIN channels c ON c.id = m.channel_id
-WHERE m.session_id = ? AND m.peer_label = ?
-ORDER BY (c.state = 'joined') DESC, m.id DESC LIMIT 1`, session, to)
-	} else {
-		row = tx.QueryRowContext(tx.ctx, `
-SELECT m.id, m.channel_id, m.session_id, m.label, m.handle, c.state
-FROM members m JOIN channels c ON c.id = m.channel_id
-WHERE m.session_id = ? AND m.handle = ?`, session, to)
+	const cols = `SELECT m.id, m.channel_id, m.session_id, m.label, m.handle, c.state, COALESCE(m.peer_label, '')
+FROM members m JOIN channels c ON c.id = m.channel_id `
+	const order = ` ORDER BY (c.state = 'joined') DESC, m.id DESC`
+	scan := func(rows *sql.Rows) ([]resolved, []string, error) {
+		defer rows.Close()
+		var out []resolved
+		var labels []string
+		for rows.Next() {
+			var r resolved
+			var pl string
+			if err := rows.Scan(&r.id, &r.channelID, &r.sessionID, &r.label, &r.handle, &r.state, &pl); err != nil {
+				return nil, nil, err
+			}
+			out = append(out, r)
+			labels = append(labels, pl)
+		}
+		return out, labels, rows.Err()
 	}
-	err := row.Scan(&r.id, &r.channelID, &r.sessionID, &r.label, &r.handle, &r.state)
-	if errors.Is(err, sql.ErrNoRows) {
-		return r, tx.unknownPeer(session, to)
+	var q string
+	var args []any
+	switch {
+	case strings.Contains(to, "/"):
+		q, args = cols+"WHERE m.session_id = ? AND m.peer_label = ?"+order, []any{session, to}
+	default:
+		// A handle wins over a bare name.
+		rows, err := tx.QueryContext(tx.ctx, cols+"WHERE m.session_id = ? AND m.handle = ?", session, to)
+		if err != nil {
+			return resolved{}, err
+		}
+		got, _, err := scan(rows)
+		if err != nil {
+			return resolved{}, err
+		}
+		if len(got) > 0 {
+			return got[0], nil
+		}
+		q, args = cols+"WHERE m.session_id = ? AND substr(m.peer_label, instr(m.peer_label, '/') + 1) = ?"+order, []any{session, to}
 	}
-	return r, err
+	rows, err := tx.QueryContext(tx.ctx, q, args...)
+	if err != nil {
+		return resolved{}, err
+	}
+	got, labels, err := scan(rows)
+	if err != nil {
+		return resolved{}, err
+	}
+	if len(got) == 0 {
+		return resolved{}, tx.unknownPeer(session, to)
+	}
+	for _, l := range labels {
+		if l != labels[0] {
+			return resolved{}, newErr(409, protocol.CodeUnknownPeer, "more than one peer is called "+quote(to)+" ("+quote(labels[0])+", "+quote(l)+"); use the full host/name label")
+		}
+	}
+	return got[0], nil
 }
 
 func (tx *Tx) unknownPeer(session int64, to string) error {

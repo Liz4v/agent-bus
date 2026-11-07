@@ -203,16 +203,9 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("B read: %s", got)
 	}
 	a.readUntil(`kind="peer_joined"`, "hostB/bob")
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(a.ok("peers", nil), "connected") {
-		if time.Now().After(deadline) {
-			t.Fatal("peers never showed B as connected")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
 
 	// 3. Both directions.
-	b.ok("send", map[string]any{"peer": "hostA/alice", "text": "hi alice"})
+	b.ok("send", map[string]any{"peer": "alice", "text": "hi alice"})
 	a.readUntil("hi alice")
 	a.ok("send", map[string]any{"peer": "hostB/bob", "text": "hi bob"})
 	b.readUntil("hi bob")

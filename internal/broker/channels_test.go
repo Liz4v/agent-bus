@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -340,5 +341,28 @@ func TestCreateChannelBumpsVersion(t *testing.T) {
 	if r.Version != v0+1 || len(r.Channels) != 1 || r.Channels[0].Handle != ha ||
 		r.Channels[0].State != protocol.StateWaiting || r.Channels[0].PeerLabel != nil {
 		t.Fatalf("version %d->%d channels %+v", v0, r.Version, r.Channels)
+	}
+}
+
+func TestSendByBareName(t *testing.T) {
+	s, _ := openTestStore(t)
+	a, b, c := newSession(t, s), newSession(t, s), newSession(t, s)
+	id1, _ := mustCreate(t, s, a, "h/a")
+	mustJoin(t, s, b, id1, "h1/bob")
+	if err := s.Send(bg, a, "bob", "hi"); err != nil {
+		t.Fatalf("bare name: %v", err)
+	}
+	if r := sync0(t, s, b, protocol.SyncRequest{}); len(r.Messages) != 1 || r.Messages[0].Text != "hi" {
+		t.Fatalf("rows: %+v", r.Messages)
+	}
+	// a second peer with the same name on another host is ambiguous
+	id2, _ := mustCreate(t, s, a, "h/a")
+	mustJoin(t, s, c, id2, "h2/bob")
+	var e *Error
+	if err := s.Send(bg, a, "bob", "x"); !errors.As(err, &e) || e.Code != protocol.CodeUnknownPeer || !strings.Contains(e.Message, "host/name") {
+		t.Fatalf("ambiguous: %v", err)
+	}
+	if err := s.Send(bg, a, "h2/bob", "ok"); err != nil {
+		t.Fatalf("full label: %v", err)
 	}
 }

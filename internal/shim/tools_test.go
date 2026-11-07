@@ -132,13 +132,8 @@ func TestHappyPathsAndChannelIDSetApart(t *testing.T) {
 	if !strings.Contains(join, "hostA/alice") {
 		t.Fatalf("join result: %s", join)
 	}
-	if !strings.Contains(b.mustOK("peers", nil), "hostA/alice") {
-		t.Fatal("peers lacks the peer")
-	}
 	a.eventually(func(s Snapshot) bool { return len(s.Channels) == 1 && s.Channels[0].State == protocol.StateConnected })
-	if got := a.mustOK("peers", nil); !strings.Contains(got, "hostB/bob") || !strings.Contains(got, "connected") {
-		t.Fatalf("creator's peers: %s", got)
-	}
+	b.eventually(func(s Snapshot) bool { return len(s.Channels) == 1 && s.Channels[0].State == protocol.StateConnected })
 }
 
 func TestInvalidMyNameAndBadArgs(t *testing.T) {
@@ -171,16 +166,16 @@ func TestSendRightAfterJoinByLabelAndHandle(t *testing.T) {
 	// no other call in between
 	a.mustOK("send", map[string]any{"peer": "hostB/bob", "text": "by label"})
 	a.mustOK("send", map[string]any{"peer": handle, "text": "by handle"})
+	a.mustOK("send", map[string]any{"peer": "bob", "text": "by name"})
 	text := b.mustOK("read", map[string]any{"wait_seconds": 5})
 	b.eventually(func(s Snapshot) bool { return len(s.Rows) > 0 || strings.Contains(text, "by handle") })
 	text += b.mustOK("read", map[string]any{"wait_seconds": 1})
-	if !strings.Contains(text, "by label") || !strings.Contains(text, "by handle") || !strings.Contains(text, Preamble) ||
+	if !strings.Contains(text, "by label") || !strings.Contains(text, "by handle") || !strings.Contains(text, "by name") || !strings.Contains(text, Preamble) ||
 		!strings.Contains(text, `from="hostA/alice"`) {
 		t.Fatalf("read: %s", text)
 	}
 	// leave by handle
-	bh := regexp.MustCompile(`handle (ch-[0-9a-f]+)`).FindStringSubmatch(b.mustOK("peers", nil))[1]
-	b.mustOK("leave", map[string]any{"peer": bh})
+	b.mustOK("leave", map[string]any{"peer": "alice"})
 	if text, isErr := a.call("send", map[string]any{"peer": "hostB/bob", "text": "x"}); !isErr || !strings.Contains(text, "left") {
 		t.Fatalf("send after leave: %s", text)
 	}
@@ -299,10 +294,6 @@ func TestBrokerStoppedReadShowsMirrorRowsAndPeersErrors(t *testing.T) {
 	if isErr || !strings.Contains(text, "arrived before outage") || !strings.Contains(text, tb.ts.URL) || !strings.Contains(text, "unreachable") {
 		t.Fatalf("read during outage: err=%v %s", isErr, text)
 	}
-	text, isErr = b.call("peers", nil)
-	if !isErr || !strings.Contains(text, tb.ts.URL) || !strings.Contains(text, "stale") || !strings.Contains(text, "hostA/alice") {
-		t.Fatalf("peers during outage: err=%v %s", isErr, text)
-	}
 	// and a read with no rows at all returns the broker error
 	text, isErr = b.call("read", nil)
 	if !isErr || !strings.Contains(text, tb.ts.URL) {
@@ -317,9 +308,6 @@ func TestUnregisteredToolsAnswerLocally(t *testing.T) {
 	start := time.Now()
 	if text := a.mustOK("read", map[string]any{"wait_seconds": 30}); !strings.HasPrefix(text, "No new messages") || time.Since(start) > time.Second {
 		t.Fatalf("unregistered read: %q after %v", text, time.Since(start))
-	}
-	if text := a.mustOK("peers", nil); !strings.Contains(text, "no channels") {
-		t.Fatalf("peers: %s", text)
 	}
 	for tool, args := range map[string]map[string]any{
 		"send":  {"peer": "x/y", "text": "t"},
@@ -452,11 +440,11 @@ func TestForced401NoticeAndEmptyPeers(t *testing.T) {
 	tb, _, b := linked(t)
 	tb.kill(b.sess.Token())
 	b.eventually(func(s Snapshot) bool { return !s.Running })
-	text := b.mustOK("peers", nil)
-	if !strings.Contains(text, "expired") || !strings.Contains(text, "no channels") {
+	text := b.mustOK("read", nil)
+	if !strings.Contains(text, "expired") {
 		t.Fatalf("first result after the drop: %q", text)
 	}
-	if text := b.mustOK("peers", nil); strings.Contains(text, "expired") {
+	if text := b.mustOK("read", nil); strings.Contains(text, "expired") {
 		t.Fatalf("notice repeated: %q", text)
 	}
 }
@@ -474,9 +462,6 @@ func TestExpiredChannelShownAndSendReportsExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.eventually(func(s Snapshot) bool { return len(s.Channels) == 1 && s.Channels[0].State == protocol.StateExpired })
-	if text := a.mustOK("peers", nil); !strings.Contains(text, "expired") {
-		t.Fatalf("peers: %s", text)
-	}
 	if text, isErr := a.call("send", map[string]any{"peer": handle, "text": "x"}); !isErr || !strings.Contains(text, "expired") {
 		t.Fatalf("send: %s", text)
 	}

@@ -76,18 +76,26 @@ The hook tells the agent, just before it goes idle, that messages are waiting or
 
 It is safe in user settings: in a session that has no agent-bus shim it finds no socket and does nothing. It never prints message content, only a count and the sender labels.
 
+## The Claude Code skill
+
+`skills/agent-bus/SKILL.md` teaches a Claude Code session the workflow below. Link it into your skills directory so edits in this repo take effect:
+
+```sh
+ln -s "$PWD/skills/agent-bus" ~/.claude/skills/agent-bus
+```
+
 ## The agent workflow
 
 1. Session A calls `create_channel` with `my_name`. The result shows the **channel ID** on its own line. The human passes exactly that line to session B.
 2. Session B calls `join_channel` with the channel ID and its own `my_name`, and learns A's label.
 3. Each side starts the wake command in the background: call `wake_command`, run the command it returns with `run_in_background`, and run it again every time it exits. It exits when a message is waiting and prints who sent it (never the content). Then call `read`.
-4. Use `send`, `read` (optionally with `wait_seconds`), `peers` and `leave` as needed.
+4. Use `send`, `read` (optionally with `wait_seconds`) and `leave` as needed.
 
-Addressing: `send` and `leave` take a `peer` that is either a label (`host/name`) or the channel handle (`ch-xxxx`). A handle never changes and works in every channel state, so use it for a channel whose label is shared with a newer one. Messages sent before anyone has joined are held and delivered on join. An unjoined channel expires after 1 hour.
+Addressing: `send` and `leave` take a `peer`: just the peer's name (the `my_name` it chose, e.g. `bob`). If two different peers share a name, the call fails and asks for the full `host/name` label. The channel handle (`ch-xxxx`) from `create_channel` still works, and is the only way to address a channel nobody has joined yet. There is no tool to list peers. Messages sent before anyone has joined are held and delivered on join. An unjoined channel expires after 1 hour.
 
 ## Hermes Agent support
 
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) (tested with 2026.9.24, read from its source and `--help`; check again after an upgrade) gets the same seven tools through the normal shim, plus a wake: a small sidecar, `agent-bus hermes-wake`, watches the shim's wake socket and, when messages are unread, POSTs one signed notification to Hermes' webhook platform. Hermes starts an agent turn whose only job is to call `read`. The notification carries the sender labels and a count, never message content. No broker change is needed.
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) (tested with 2026.9.24, read from its source and `--help`; check again after an upgrade) gets the same six tools through the normal shim, plus a wake: a small sidecar, `agent-bus hermes-wake`, watches the shim's wake socket and, when messages are unread, POSTs one signed notification to Hermes' webhook platform. Hermes starts an agent turn whose only job is to call `read`. The notification carries the sender labels and a count, never message content. No broker change is needed.
 
 ### 1. Install the binary
 
