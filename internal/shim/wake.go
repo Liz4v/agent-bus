@@ -29,7 +29,7 @@ type WakeOptions struct {
 	UID        int    // default os.Getuid()
 	PPID       int    // default os.Getppid()
 	Debounce   time.Duration
-	Rearm      time.Duration
+	Rearm      time.Duration // 0 (default): a wait never times out; >0 makes it reply "rearm" after this long
 	Log        *slog.Logger
 
 	// Socket is a fixed, absolute wake-socket path (Hermes sidecar). Empty
@@ -105,9 +105,6 @@ func (o WakeOptions) withDefaults() WakeOptions {
 	}
 	if o.Debounce == 0 {
 		o.Debounce = protocol.WakeDebounce
-	}
-	if o.Rearm == 0 {
-		o.Rearm = protocol.WaitRearmAfter
 	}
 	if o.Log == nil {
 		o.Log = slog.Default()
@@ -381,8 +378,14 @@ func (w *Wake) handleWait(c net.Conn, br *bufio.Reader) {
 		io.Copy(io.Discard, br)
 		cancel()
 	}()
-	rearm := time.NewTimer(w.opt.Rearm)
-	defer rearm.Stop()
+	// A wait normally stays armed until a message arrives or its process
+	// goes away (hang-up detection above), so a nil channel means "never".
+	var rearmC <-chan time.Time
+	if w.opt.Rearm > 0 {
+		rearm := time.NewTimer(w.opt.Rearm)
+		defer rearm.Stop()
+		rearmC = rearm.C
+	}
 	for {
 		changed := w.m.Changed()
 		sum := w.m.Summary()
@@ -406,7 +409,7 @@ func (w *Wake) handleWait(c net.Conn, br *bufio.Reader) {
 		}
 		select {
 		case <-changed:
-		case <-rearm.C:
+		case <-rearmC:
 			w.reply(c, protocol.WaitReply{Status: protocol.WaitRearm})
 			return
 		case <-ctx.Done():

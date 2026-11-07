@@ -412,3 +412,21 @@ func TestWakeOptionsFromEnvHonoursXDGRuntimeDir(t *testing.T) {
 		t.Fatalf("fallback dir %q, want %q", got, want)
 	}
 }
+
+func TestWaitStaysArmedByDefault(t *testing.T) {
+	e := newWakeEnv(t, WakeOptions{})
+	e.link()
+	e.commitAll()
+	c, err := net.Dial("unix", e.w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte(protocol.WakeCmdWait + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
+	if line, err := bufio.NewReader(c).ReadString('\n'); err == nil {
+		t.Fatalf("wait replied without a message or a timeout option: %q", line)
+	}
+}

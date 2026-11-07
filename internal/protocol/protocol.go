@@ -23,8 +23,7 @@ const (
 	SyncWait    = 20 * time.Second // shim long-poll length
 	SyncWaitCap = 30 * time.Second // broker-side cap on any sync wait
 
-	WaitRearmAfter = time.Hour
-	WakeDebounce   = 2 * time.Second
+	WakeDebounce = 2 * time.Second
 )
 
 // Error codes carried in ErrorBody.
