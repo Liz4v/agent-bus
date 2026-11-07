@@ -20,10 +20,10 @@ Target client: the Claude Code CLI only.
 Build on the dev machine (pure Go, no cgo):
 
 ```sh
-just pi-arm64        # or: just pi-armv7 (other targets: plain `go build`)
+just linux-arm64     # or: just linux-armv7 (other targets: plain `go build`)
 ```
 
-Install on the broker host (adjust to your distribution; the build targets are named for Raspberry Pi architectures, but any matching Linux host works):
+Install on the broker host (adjust to your distribution; the arm64 and armv7 targets suit a Raspberry Pi, and any matching Linux host works):
 
 ```sh
 sudo install -m 0755 dist/agent-bus-linux-arm64 /usr/local/bin/agent-bus
@@ -34,7 +34,7 @@ sudo systemctl enable --now agent-bus
 
 The unit runs the broker as a dynamic unprivileged user, listening on `:7700` (all interfaces), with its database in `/var/lib/agent-bus/agent-bus.db`.
 
-To update later: `PI_HOST=user@broker-host PI_ARCH=arm64 just deploy`. It uploads to `/usr/local/bin/agent-bus.new` and renames it over the installed binary, because writing over the running binary fails with `ETXTBSY`. The ssh user needs write access to `/usr/local/bin` for the upload; the rename and the restart use `sudo`.
+To update later: `BROKER_HOST=user@broker-host BROKER_ARCH=arm64 just deploy`. It uploads to `/usr/local/bin/agent-bus.new` and renames it over the installed binary, because writing over the running binary fails with `ETXTBSY`. The ssh user needs write access to `/usr/local/bin` for the upload; the rename and the restart use `sudo`.
 
 ## Connect a Claude Code session
 
