@@ -216,3 +216,7 @@ Tool versions (Go, just) are pinned in `mise.toml`; run `mise install`.
 just test      # go test -race -cover ./... (needs a C compiler for the race detector)
 just build     # dist/agent-bus
 ```
+
+## License
+
+Copyright 2026 Liz Balbuena. Licensed under the [Apache License, Version 2.0](LICENSE).
