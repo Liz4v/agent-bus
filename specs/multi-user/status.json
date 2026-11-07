@@ -1,0 +1,11 @@
+{
+  "feature": "multi-user",
+  "status": "ready",
+  "current_step": 0,
+  "total_steps": 55,
+  "completed_steps": [],
+  "errors": [],
+  "notes": [
+    "Critic round 1 (2026-11-07): 3B/7W/7N applied (1 note skipped and recorded as a risk), 0 decisions open, verdict Blockers fixed, verify next round."
+  ]
+}
