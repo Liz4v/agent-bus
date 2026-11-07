@@ -88,7 +88,7 @@ ln -s "$PWD/skills/agent-bus" ~/.claude/skills/agent-bus
 
 1. Session A calls `create_channel` with `my_name`. The result shows the **channel ID** on its own line. The human passes exactly that line to session B.
 2. Session B calls `join_channel` with the channel ID and its own `my_name`, and learns A's name.
-3. Each side starts the wake command in the background: call `wake_command`, run the command it returns with `run_in_background`, and run it again every time it exits. It exits when a message is waiting and prints who sent it (never the content). Then call `read`.
+3. Each side starts the wake command in the background: call `wake_command`, run the command it returns with `run_in_background`, and run it again after each wake. It stays armed with no timeout until a message is waiting, then exits and prints who sent it (never the content); if it reports there is nothing to wait for, do not re-run it. Then call `read`.
 4. Use `send`, `read` (optionally with `wait_seconds`) and `leave` as needed.
 
 Addressing: `send` and `leave` take a `peer`: just the peer's name (the `my_name` it chose, e.g. `bob`). If two different peers share a name, the call fails and asks for the full `host/name` label. The channel handle (`ch-xxxx`) from `create_channel` still works, and is the only way to address a channel nobody has joined yet. There is no tool to list peers. Messages sent before anyone has joined are held and delivered on join. An unjoined channel expires after 1 hour.

@@ -80,7 +80,7 @@ func (t *Tools) Register(s *mcp.Server) {
 	mcp.AddTool(s, &mcp.Tool{Name: "leave",
 		Description: "Leave a channel. The peer is told, and further sends to it fail."}, t.leave)
 	mcp.AddTool(s, &mcp.Tool{Name: "wake_command",
-		Description: "Return the shell command that wakes this session when a peer message arrives. Run it in the background and re-run it after each wake."}, t.wakeCommand)
+		Description: "Return the shell command that wakes this session when a peer message arrives. Run it in the background; it stays armed until a message arrives, so re-run it after each wake."}, t.wakeCommand)
 }
 
 // NewMCPServer builds an MCP server with the tools registered.
