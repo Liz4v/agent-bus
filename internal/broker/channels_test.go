@@ -23,7 +23,7 @@ func mustCreate(t *testing.T, s *Store, sess int64, label string) (string, strin
 
 func mustJoin(t *testing.T, s *Store, sess int64, id, label string) (string, string) {
 	t.Helper()
-	h, p, err := s.JoinChannel(bg, sess, id, label)
+	h, p, _, err := s.JoinChannel(bg, sess, id, label)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestConcurrentJoinsExactlyOneSucceeds(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, _, results[i] = s.JoinChannel(bg, sessions[i], id, "h/joiner"+string(rune('a'+i)))
+			_, _, _, results[i] = s.JoinChannel(bg, sessions[i], id, "h/joiner"+string(rune('a'+i)))
 		}(i)
 	}
 	wg.Wait()
@@ -81,30 +81,33 @@ func TestConcurrentJoinsExactlyOneSucceeds(t *testing.T) {
 func TestGenericJoinErrors(t *testing.T) {
 	s, _ := openTestStore(t)
 	a, b, c := newSession(t, s), newSession(t, s), newSession(t, s)
-	wantCode(t, func() error { _, _, e := s.JoinChannel(bg, b, "00000000-0000-4000-8000-000000000000", "h/b"); return e }(), ErrNoOpen)
+	wantCode(t, func() error {
+		_, _, _, e := s.JoinChannel(bg, b, "00000000-0000-4000-8000-000000000000", "h/b")
+		return e
+	}(), ErrNoOpen)
 
 	// expired
 	idExp, _ := mustCreate(t, s, a, "h/a")
 	if _, err := s.db.Exec("UPDATE channels SET state = 'expired'"); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := s.JoinChannel(bg, b, idExp, "h/b")
+	_, _, _, err := s.JoinChannel(bg, b, idExp, "h/b")
 	wantCode(t, err, ErrNoOpen)
 
 	// joined (full), including with the creator's label
 	a2 := newSession(t, s)
 	idJ, _ := mustCreate(t, s, a2, "h/a2")
 	mustJoin(t, s, b, idJ, "h/b")
-	_, _, err = s.JoinChannel(bg, c, idJ, "h/c")
+	_, _, _, err = s.JoinChannel(bg, c, idJ, "h/c")
 	wantCode(t, err, ErrNoOpen)
-	_, _, err = s.JoinChannel(bg, c, idJ, "h/a2")
+	_, _, _, err = s.JoinChannel(bg, c, idJ, "h/a2")
 	wantCode(t, err, ErrNoOpen)
 
 	// ended
 	if err := s.Leave(bg, b, "h/a2"); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = s.JoinChannel(bg, c, idJ, "h/c")
+	_, _, _, err = s.JoinChannel(bg, c, idJ, "h/c")
 	wantCode(t, err, ErrNoOpen)
 
 	// deleted: both left
@@ -116,7 +119,7 @@ func TestGenericJoinErrors(t *testing.T) {
 	if n != 0 {
 		t.Fatal("channel not deleted")
 	}
-	_, _, err = s.JoinChannel(bg, c, idJ, "h/c")
+	_, _, _, err = s.JoinChannel(bg, c, idJ, "h/c")
 	wantCode(t, err, ErrNoOpen)
 }
 
@@ -124,11 +127,11 @@ func TestSameLabelRules(t *testing.T) {
 	s, _ := openTestStore(t)
 	a, b := newSession(t, s), newSession(t, s)
 	id, _ := mustCreate(t, s, a, "h/a")
-	_, _, err := s.JoinChannel(bg, a, id, "h/other")
+	_, _, _, err := s.JoinChannel(bg, a, id, "h/other")
 	wantCode(t, err, ErrSameLabel)
-	_, _, err = s.JoinChannel(bg, b, id, "h/a")
+	_, _, _, err = s.JoinChannel(bg, b, id, "h/a")
 	wantCode(t, err, ErrSameLabel)
-	_, _, err = s.JoinChannel(bg, b, id, `bad"label/x`)
+	_, _, _, err = s.JoinChannel(bg, b, id, `bad"label/x`)
 	wantCode(t, err, ErrBadLabel)
 	if _, _, err = s.CreateChannel(bg, a, "nolabel"); err == nil {
 		t.Fatal("bad label accepted on create")
@@ -143,7 +146,7 @@ func TestDuplicatePeerCreatorSide(t *testing.T) {
 	id1, _ := mustCreate(t, s, a, "h/a")
 	mustJoin(t, s, b, id1, "h/b") // a's session now has a joined channel with peer h/b
 	id3, _ := mustCreate(t, s, a, "h/a3")
-	_, _, err := s.JoinChannel(bg, b, id3, "h/b")
+	_, _, _, err := s.JoinChannel(bg, b, id3, "h/b")
 	wantCode(t, err, ErrDuplicate)
 }
 
@@ -153,7 +156,7 @@ func TestDuplicatePeerJoinerSide(t *testing.T) {
 	id1, _ := mustCreate(t, s, a, "h/a")
 	mustJoin(t, s, b, id1, "h/b") // b's peer label is h/a
 	idC, _ := mustCreate(t, s, c, "h/a")
-	_, _, err := s.JoinChannel(bg, b, idC, "h/b2")
+	_, _, _, err := s.JoinChannel(bg, b, idC, "h/b2")
 	wantCode(t, err, ErrDuplicate)
 }
 
@@ -257,7 +260,7 @@ func TestCreatorLeavingOpenChannelDeletesIt(t *testing.T) {
 	if nc != 0 || nh != 0 {
 		t.Fatalf("channels=%d held=%d after creator left", nc, nh)
 	}
-	_, _, err := s.JoinChannel(bg, b, id, "h/b")
+	_, _, _, err := s.JoinChannel(bg, b, id, "h/b")
 	wantCode(t, err, ErrNoOpen)
 }
 
@@ -364,5 +367,95 @@ func TestSendByBareName(t *testing.T) {
 	}
 	if err := s.Send(bg, a, "h2/bob", "ok"); err != nil {
 		t.Fatalf("full label: %v", err)
+	}
+}
+
+func strp(p *string) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return *p
+}
+
+func TestAccountFieldsOnJoinAndHeldDelivery(t *testing.T) {
+	s, _ := openTestStore(t)
+	a, _ := newSessionFor(t, s, "alice")
+	b, _ := newSessionFor(t, s, "bob")
+	id, ha := mustCreate(t, s, a, "h/a")
+	// Sent while the channel is still open: held with the sender's account.
+	if err := s.Send(bg, a, ha, "early"); err != nil {
+		t.Fatal(err)
+	}
+	hb, peer, peerAccount, err := s.JoinChannel(bg, b, id, "h/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peer != "h/a" || peerAccount != "alice" {
+		t.Fatalf("join returned peer %q account %q", peer, peerAccount)
+	}
+	rb := sync0(t, s, b, protocol.SyncRequest{})
+	if len(rb.Messages) != 1 || rb.Messages[0].Text != "early" || strp(rb.Messages[0].FromAccount) != "alice" {
+		t.Fatalf("held delivery: %+v", rb.Messages)
+	}
+	if len(rb.Channels) != 1 || strp(rb.Channels[0].PeerAccount) != "alice" || rb.Channels[0].Handle != hb {
+		t.Fatalf("joiner channel list: %+v", rb.Channels)
+	}
+	// The creator's peer_joined row carries the joiner's account.
+	ra := sync0(t, s, a, protocol.SyncRequest{})
+	if len(ra.Messages) != 1 || ra.Messages[0].Kind != protocol.KindPeerJoined || strp(ra.Messages[0].FromAccount) != "bob" ||
+		strp(ra.Messages[0].FromLabel) != "h/b" {
+		t.Fatalf("peer_joined row: %+v", ra.Messages)
+	}
+	if strp(ra.Channels[0].PeerAccount) != "bob" {
+		t.Fatalf("creator channel list: %+v", ra.Channels)
+	}
+	// Live text carries the sender's account.
+	if err := s.Send(bg, b, "h/a", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	ra = sync0(t, s, a, protocol.SyncRequest{After: ra.Messages[0].ID})
+	if len(ra.Messages) != 1 || strp(ra.Messages[0].FromAccount) != "bob" {
+		t.Fatalf("text row: %+v", ra.Messages)
+	}
+	// peer_left carries the leaver's account.
+	if err := s.Leave(bg, b, "h/a"); err != nil {
+		t.Fatal(err)
+	}
+	ra = sync0(t, s, a, protocol.SyncRequest{After: ra.Messages[0].ID})
+	if len(ra.Messages) != 1 || ra.Messages[0].Kind != protocol.KindPeerLeft || strp(ra.Messages[0].FromAccount) != "bob" {
+		t.Fatalf("peer_left row: %+v", ra.Messages)
+	}
+}
+
+func TestUnknownPeerKnownPeersIncludeAccount(t *testing.T) {
+	s, _ := openTestStore(t)
+	a, _ := newSessionFor(t, s, "alice")
+	b, _ := newSessionFor(t, s, "bob")
+	id, _ := mustCreate(t, s, a, "h/a")
+	mustJoin(t, s, b, id, "h/b")
+	err := s.Send(bg, a, "nobody", "x")
+	var e *Error
+	if !errors.As(err, &e) || e.Code != protocol.CodeUnknownPeer || len(e.KnownPeers) != 1 || e.KnownPeers[0].Account != "bob" {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestSendToRemovedChannelAndLeave(t *testing.T) {
+	s, _ := openTestStore(t)
+	a, _ := newSessionFor(t, s, "alice")
+	b, _ := newSessionFor(t, s, "bob")
+	id, _ := mustCreate(t, s, a, "h/a")
+	mustJoin(t, s, b, id, "h/b")
+	if err := s.update(bg, func(tx *Tx) error { return tx.deleteSession(a, reasonRemoved) }); err != nil {
+		t.Fatal(err)
+	}
+	wantCode(t, s.Send(bg, b, "h/a", "x"), ErrPeerRemoved)
+	if err := s.Leave(bg, b, "h/a"); err != nil {
+		t.Fatalf("leave on a removed channel: %v", err)
+	}
+	var n int
+	s.db.QueryRow("SELECT COUNT(*) FROM channels").Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d channels left behind", n)
 	}
 }

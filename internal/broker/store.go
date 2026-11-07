@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/Liz4v/agent-bus/internal/protocol"
@@ -38,6 +40,7 @@ var (
 	ErrSameLabel    = newErr(http.StatusBadRequest, protocol.CodeSameLabel, "cannot join a channel under the creator's own label or from the creator's own session")
 	ErrDuplicate    = newErr(http.StatusConflict, protocol.CodeDuplicatePeer, "this session already has a live channel with that peer")
 	ErrPeerLeft     = newErr(http.StatusGone, protocol.CodePeerLeft, "the peer has left this channel")
+	ErrPeerRemoved  = newErr(http.StatusGone, protocol.CodePeerRemoved, "the peer's account was removed by the hostmaster; the channel has ended")
 	ErrExpired      = newErr(http.StatusGone, protocol.CodeChannelExpire, "the channel expired before anyone joined")
 	ErrEmpty        = newErr(http.StatusBadRequest, protocol.CodeEmpty, "message text is empty")
 )
@@ -55,20 +58,59 @@ type Store struct {
 	db     *sql.DB
 	notify *Notify
 	now    Clock
+	claims *claims
+	log    *slog.Logger
 }
 
-const schema = `
+// SetLogger sets the logger used for registration refusals and similar
+// store-level audit lines. nil restores the default logger.
+func (s *Store) SetLogger(l *slog.Logger) {
+	if l == nil {
+		l = slog.Default()
+	}
+	s.log = l
+}
+
+// schemaV2 is migration 2 (multi-user M2): accounts own sessions. The old
+// channel and session tables are dropped first; nothing survives the upgrade.
+const schemaV2 = `
+DROP TABLE IF EXISTS inbox;
+DROP TABLE IF EXISTS held;
+DROP TABLE IF EXISTS members;
+DROP TABLE IF EXISTS channels;
+DROP TABLE IF EXISTS sessions;
+CREATE TABLE accounts(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  name_key TEXT NOT NULL UNIQUE,
+  cred_hash BLOB NOT NULL UNIQUE,
+  status TEXT NOT NULL CHECK (status IN ('pending','active')),
+  is_hostmaster INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER NULL);
+CREATE UNIQUE INDEX accounts_one_hostmaster ON accounts(is_hostmaster) WHERE is_hostmaster = 1;
+CREATE TABLE retired(
+  cred_hash BLOB PRIMARY KEY,
+  name TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('rejected','expired','removed')),
+  at INTEGER NOT NULL);
+CREATE TABLE settings(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL);
 CREATE TABLE sessions(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   token_hash BLOB UNIQUE NOT NULL,
+  account_id INTEGER NOT NULL REFERENCES accounts ON DELETE RESTRICT,
   created_at INTEGER NOT NULL,
   disconnected_at INTEGER NULL,
-  version INTEGER NOT NULL DEFAULT 0);
+  version INTEGER NOT NULL DEFAULT 0,
+  admin_sub INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX sessions_account ON sessions(account_id);
 CREATE TABLE channels(
   id INTEGER PRIMARY KEY,
   id_hash BLOB UNIQUE NOT NULL,
   created_at INTEGER NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('open','joined','ended','expired')));
+  state TEXT NOT NULL CHECK (state IN ('open','joined','ended','expired','removed')));
 CREATE TABLE members(
   id INTEGER PRIMARY KEY,
   channel_id INTEGER NOT NULL REFERENCES channels ON DELETE RESTRICT,
@@ -76,12 +118,15 @@ CREATE TABLE members(
   label TEXT NOT NULL,
   handle TEXT NOT NULL,
   peer_label TEXT NULL,
+  account TEXT NOT NULL,
+  peer_account TEXT NULL,
   UNIQUE(session_id, handle),
   UNIQUE(channel_id, label));
 CREATE TABLE held(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   channel_id INTEGER NOT NULL REFERENCES channels ON DELETE CASCADE,
   from_label TEXT NOT NULL,
+  from_account TEXT NOT NULL,
   text TEXT NOT NULL,
   at INTEGER NOT NULL);
 CREATE TABLE inbox(
@@ -89,6 +134,7 @@ CREATE TABLE inbox(
   session_id INTEGER NOT NULL REFERENCES sessions ON DELETE CASCADE,
   handle TEXT NOT NULL,
   from_label TEXT NULL,
+  from_account TEXT NULL,
   kind TEXT NOT NULL,
   text TEXT NOT NULL,
   at INTEGER NOT NULL);
@@ -115,7 +161,7 @@ func OpenStore(path string, notify *Notify, now Clock) (*Store, error) {
 		return nil, fmt.Errorf("open database %s: %w", path, err)
 	}
 	db.SetMaxOpenConns(4)
-	s := &Store{db: db, notify: notify, now: now}
+	s := &Store{db: db, notify: notify, now: now, claims: &claims{}, log: slog.Default()}
 	if err := s.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -139,16 +185,36 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	if v >= 1 {
+	if v >= 2 {
 		return nil
 	}
-	if _, err := tx.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("migration 1: %w", err)
+	if _, err := tx.ExecContext(ctx, schemaV2); err != nil {
+		return fmt.Errorf("migration 2: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	return tx.Commit()
+}
+
+// maxAccounts returns the active-account cap: the settings row, or the
+// default when it is absent.
+func maxAccounts(ctx context.Context, q interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}) (int, error) {
+	var v string
+	err := q.QueryRowContext(ctx, "SELECT value FROM settings WHERE key = 'max_accounts'").Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return protocol.DefaultMaxAccounts, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return protocol.DefaultMaxAccounts, nil
+	}
+	return n, nil
 }
 
 // Tx is a write transaction that records which sessions' versions it bumped.
@@ -198,11 +264,13 @@ func (tx *Tx) bump(session int64) error {
 // when the session itself is being deleted, so its long-polls wake and 401).
 func (tx *Tx) wakeOnly(session int64) { tx.bumped[session] = struct{}{} }
 
-// enqueue inserts a row into a session's inbox and bumps its version.
-func (tx *Tx) enqueue(session int64, handle string, from *string, kind, text string) error {
+// enqueue inserts a row into a session's inbox and bumps its version. from and
+// fromAccount are the sender's label and verified account name (nil for rows
+// with no sender).
+func (tx *Tx) enqueue(session int64, handle string, from, fromAccount *string, kind, text string) error {
 	if _, err := tx.ExecContext(tx.ctx,
-		"INSERT INTO inbox(session_id, handle, from_label, kind, text, at) VALUES(?,?,?,?,?,?)",
-		session, handle, from, kind, text, tx.now); err != nil {
+		"INSERT INTO inbox(session_id, handle, from_label, from_account, kind, text, at) VALUES(?,?,?,?,?,?,?)",
+		session, handle, from, fromAccount, kind, text, tx.now); err != nil {
 		return err
 	}
 	return tx.bump(session)
@@ -214,10 +282,19 @@ type member struct {
 	sessionID int64
 	label     string
 	handle    string
+	account   string
 }
 
+// removeReason says why a membership ends (M8).
+type removeReason int
+
+const (
+	reasonLeft    removeReason = iota // the member left, or its session was reaped
+	reasonRemoved                     // the member's account was removed by the hostmaster
+)
+
 // removeMember is the only code that deletes a membership (I6).
-func (tx *Tx) removeMember(m member) error {
+func (tx *Tx) removeMember(m member, reason removeReason) error {
 	if _, err := tx.ExecContext(tx.ctx, "DELETE FROM members WHERE id = ?", m.id); err != nil {
 		return err
 	}
@@ -238,11 +315,15 @@ func (tx *Tx) removeMember(m member) error {
 		return err
 	default:
 		if state == "joined" {
-			if _, err := tx.ExecContext(tx.ctx, "UPDATE channels SET state = 'ended' WHERE id = ?", m.channelID); err != nil {
+			newState, kind := "ended", protocol.KindPeerLeft
+			if reason == reasonRemoved {
+				newState, kind = "removed", protocol.KindPeerRemoved
+			}
+			if _, err := tx.ExecContext(tx.ctx, "UPDATE channels SET state = ? WHERE id = ?", newState, m.channelID); err != nil {
 				return err
 			}
-			label := m.label
-			if err := tx.enqueue(otherSession, otherHandle, &label, protocol.KindPeerLeft, ""); err != nil {
+			label, account := m.label, m.account
+			if err := tx.enqueue(otherSession, otherHandle, &label, &account, kind, ""); err != nil {
 				return err
 			}
 		}
@@ -256,7 +337,7 @@ func (tx *Tx) removeMember(m member) error {
 // sessionMembers lists a session's memberships, oldest first.
 func (tx *Tx) sessionMembers(session int64) ([]member, error) {
 	rows, err := tx.QueryContext(tx.ctx,
-		"SELECT id, channel_id, session_id, label, handle FROM members WHERE session_id = ? ORDER BY id", session)
+		"SELECT id, channel_id, session_id, label, handle, account FROM members WHERE session_id = ? ORDER BY id", session)
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +345,7 @@ func (tx *Tx) sessionMembers(session int64) ([]member, error) {
 	var out []member
 	for rows.Next() {
 		var m member
-		if err := rows.Scan(&m.id, &m.channelID, &m.sessionID, &m.label, &m.handle); err != nil {
+		if err := rows.Scan(&m.id, &m.channelID, &m.sessionID, &m.label, &m.handle, &m.account); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -272,11 +353,24 @@ func (tx *Tx) sessionMembers(session int64) ([]member, error) {
 	return out, rows.Err()
 }
 
-// CreateSession registers a session and returns its token and ID.
-func (s *Store) CreateSession(ctx context.Context) (token string, id int64, err error) {
+// CreateSession registers a session owned by an active account and returns its
+// token and ID. The account is re-checked inside the transaction, so a
+// session can never outlive the removal of its account (M1).
+func (s *Store) CreateSession(ctx context.Context, accountID int64) (token string, id int64, err error) {
 	token = secret.NewToken()
 	err = s.update(ctx, func(tx *Tx) error {
-		res, err := tx.ExecContext(ctx, "INSERT INTO sessions(token_hash, created_at) VALUES(?,?)", secret.Hash(token), tx.now)
+		var status string
+		err := tx.QueryRowContext(ctx, "SELECT status FROM accounts WHERE id = ?", accountID).Scan(&status)
+		if errors.Is(err, sql.ErrNoRows) {
+			return errAccountRemoved
+		}
+		if err != nil {
+			return err
+		}
+		if status != protocol.AccountActive {
+			return errAccountPending
+		}
+		res, err := tx.ExecContext(ctx, "INSERT INTO sessions(token_hash, account_id, created_at) VALUES(?,?,?)", secret.Hash(token), accountID, tx.now)
 		if err != nil {
 			return err
 		}
@@ -303,17 +397,17 @@ func (s *Store) SessionByToken(ctx context.Context, token string) (int64, error)
 // the session (its inbox goes with it).
 func (s *Store) DeleteSelf(ctx context.Context, session int64) error {
 	return s.update(ctx, func(tx *Tx) error {
-		return tx.deleteSession(session)
+		return tx.deleteSession(session, reasonLeft)
 	})
 }
 
-func (tx *Tx) deleteSession(session int64) error {
+func (tx *Tx) deleteSession(session int64, reason removeReason) error {
 	ms, err := tx.sessionMembers(session)
 	if err != nil {
 		return err
 	}
 	for _, m := range ms {
-		if err := tx.removeMember(m); err != nil {
+		if err := tx.removeMember(m, reason); err != nil {
 			return err
 		}
 	}
@@ -341,9 +435,14 @@ func (s *Store) Sync(ctx context.Context, session int64, req protocol.SyncReques
 		if err != nil {
 			return err
 		}
+		var adminSub int
+		if err := tx.QueryRowContext(ctx, "SELECT admin_sub FROM sessions WHERE id = ?", session).Scan(&adminSub); err != nil {
+			return err
+		}
+		resp.AdminSubscribed = adminSub == 1
 		resp.Messages = []protocol.Message{}
 		rows, err := tx.QueryContext(ctx,
-			"SELECT id, handle, from_label, kind, text, at FROM inbox WHERE session_id = ? AND id > ? ORDER BY id",
+			"SELECT id, handle, from_label, from_account, kind, text, at FROM inbox WHERE session_id = ? AND id > ? ORDER BY id",
 			session, req.After)
 		if err != nil {
 			return err
@@ -351,8 +450,8 @@ func (s *Store) Sync(ctx context.Context, session int64, req protocol.SyncReques
 		size := 0
 		for rows.Next() {
 			var m protocol.Message
-			var from sql.NullString
-			if err := rows.Scan(&m.ID, &m.Handle, &from, &m.Kind, &m.Text, &m.At); err != nil {
+			var from, fromAccount sql.NullString
+			if err := rows.Scan(&m.ID, &m.Handle, &from, &fromAccount, &m.Kind, &m.Text, &m.At); err != nil {
 				rows.Close()
 				return err
 			}
@@ -364,6 +463,10 @@ func (s *Store) Sync(ctx context.Context, session int64, req protocol.SyncReques
 			if from.Valid {
 				f := from.String
 				m.FromLabel = &f
+			}
+			if fromAccount.Valid {
+				a := fromAccount.String
+				m.FromAccount = &a
 			}
 			size += rowSize
 			resp.Messages = append(resp.Messages, m)
@@ -382,7 +485,7 @@ func (s *Store) Sync(ctx context.Context, session int64, req protocol.SyncReques
 // channelList derives each membership's state per the D10 table.
 func (tx *Tx) channelList(session int64) ([]protocol.Channel, error) {
 	rows, err := tx.QueryContext(tx.ctx, `
-SELECT m.handle, m.label, m.peer_label, c.state, c.created_at, ps.disconnected_at
+SELECT m.handle, m.label, m.peer_label, m.peer_account, c.state, c.created_at, ps.disconnected_at
 FROM members m
 JOIN channels c ON c.id = m.channel_id
 LEFT JOIN members o ON o.channel_id = m.channel_id AND o.id <> m.id
@@ -396,15 +499,19 @@ ORDER BY m.id`, session)
 	out := []protocol.Channel{}
 	for rows.Next() {
 		var ch protocol.Channel
-		var peer sql.NullString
+		var peer, peerAccount sql.NullString
 		var state string
 		var disc sql.NullInt64
-		if err := rows.Scan(&ch.Handle, &ch.Label, &peer, &state, &ch.CreatedAt, &disc); err != nil {
+		if err := rows.Scan(&ch.Handle, &ch.Label, &peer, &peerAccount, &state, &ch.CreatedAt, &disc); err != nil {
 			return nil, err
 		}
 		if peer.Valid {
 			p := peer.String
 			ch.PeerLabel = &p
+		}
+		if peerAccount.Valid {
+			a := peerAccount.String
+			ch.PeerAccount = &a
 		}
 		switch state {
 		case "open":
@@ -419,6 +526,8 @@ ORDER BY m.id`, session)
 			ch.State = protocol.StatePeerLeft
 		case "expired":
 			ch.State = protocol.StateExpired
+		case "removed":
+			ch.State = protocol.StatePeerRemoved
 		}
 		out = append(out, ch)
 	}

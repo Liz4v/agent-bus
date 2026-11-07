@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/Liz4v/agent-bus/internal/client"
 	"github.com/Liz4v/agent-bus/internal/protocol"
+	"github.com/Liz4v/agent-bus/internal/testutil"
 )
 
 // mirrorEnv is a shim session ("h/me") linked to a raw peer session ("h/peer").
@@ -31,7 +31,13 @@ func fastCfg() MirrorConfig {
 func newMirrorEnv(t *testing.T, cfg MirrorConfig) *mirrorEnv {
 	t.Helper()
 	tb := newTestBroker(t)
-	sess := NewSession(tb.c)
+	return newMirrorEnvFor(t, tb, cfg, tb.c)
+}
+
+// newMirrorEnvFor builds a mirror env whose shim session uses client c.
+func newMirrorEnvFor(t *testing.T, tb *testBroker, cfg MirrorConfig, c *client.Client) *mirrorEnv {
+	t.Helper()
+	sess := NewSession(c)
 	m := NewMirror(sess, cfg)
 	t.Cleanup(m.Stop)
 	return &mirrorEnv{t: t, tb: tb, sess: sess, m: m}
@@ -49,7 +55,7 @@ func (e *mirrorEnv) link() {
 		e.t.Fatal(err)
 	}
 	e.handle = ch.Handle
-	e.peerTok, _ = e.tb.c.CreateSession(bg)
+	e.peerTok, _, _ = e.tb.c.CreateSession(bg)
 	if _, err := e.tb.c.JoinChannel(bg, e.peerTok, ch.ChannelID, "h/peer"); err != nil {
 		e.t.Fatal(err)
 	}
@@ -276,7 +282,7 @@ func TestNewLoopStartsFromZeroAndSeesLeaveQuickly(t *testing.T) {
 	}
 	ch, _ := e.tb.c.CreateChannel(bg, tok, "h/me")
 	e.eventually(func(s Snapshot) bool { return len(s.Channels) == 1 && s.Channels[0].State == protocol.StateWaiting })
-	e.peerTok, _ = e.tb.c.CreateSession(bg) // the old peer is still linked to the old session
+	e.peerTok, _, _ = e.tb.c.CreateSession(bg) // the old peer is still linked to the old session
 	if _, err := e.tb.c.JoinChannel(bg, e.peerTok, ch.ChannelID, "h/peer"); err != nil {
 		t.Fatal(err)
 	}
@@ -295,11 +301,11 @@ func scriptedBroker(t *testing.T, script []protocol.SyncResponse) *Session {
 	t.Helper()
 	var mu sync.Mutex
 	next := 0
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts, pin := testutil.TLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/sessions":
 			w.WriteHeader(201)
-			w.Write([]byte(`{"session_token":"tok"}`))
+			w.Write([]byte(`{"session_token":"tok","account":"a"}`))
 		case "/v1/sync":
 			mu.Lock()
 			i := next
@@ -315,8 +321,7 @@ func scriptedBroker(t *testing.T, script []protocol.SyncResponse) *Session {
 			json.NewEncoder(w).Encode(script[i])
 		}
 	}))
-	t.Cleanup(ts.Close)
-	return NewSession(client.New(ts.URL))
+	return NewSession(testClient(t, ts.URL, pin))
 }
 
 func TestStaleResponseRowsNotAppended(t *testing.T) {
@@ -464,5 +469,99 @@ func TestSummaryCursor(t *testing.T) {
 	e.m.Refresh(bg)
 	if c := e.m.Summary().Cursor; c != 0 {
 		t.Fatalf("cursor %d after session reset", c)
+	}
+}
+
+func TestAdminSubscribedPropagates(t *testing.T) {
+	tb := newTestBroker(t)
+	sess := NewSession(tb.newClient(tb.bossCred))
+	m := NewMirror(sess, fastCfg())
+	t.Cleanup(m.Stop)
+	tok, err := sess.Ensure(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+	defer cancel()
+	if s, _ := m.WaitChange(ctx, func(s Snapshot) bool { return s.Running }); s.AdminSubscribed {
+		t.Fatal("subscribed before asking")
+	}
+	if _, err := sess.Client().SetAdminSubscription(bg, tok, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.WaitChange(ctx, func(s Snapshot) bool { return s.AdminSubscribed }); err != nil {
+		t.Fatal("AdminSubscribed never reached the mirror")
+	}
+	if !m.Summary().AdminSubscribed {
+		t.Fatal("Summary lacks AdminSubscribed")
+	}
+}
+
+func eventuallyDropped(t *testing.T, s *Session) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.Token() != "" {
+		if time.Now().After(deadline) {
+			t.Fatal("session was not dropped")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestMirror401WithRemovedAccountGivesRemovedNotice(t *testing.T) {
+	tb := newTestBroker(t)
+	sess := NewSession(tb.newClient(tb.user("victim")))
+	m := NewMirror(sess, fastCfg())
+	t.Cleanup(m.Stop)
+	tok, _ := sess.Ensure(bg)
+	if _, err := sess.Client().CreateChannel(bg, tok, "h/me"); err != nil {
+		t.Fatal(err)
+	}
+	m.Refresh(bg)
+	if _, _, err := tb.store.Remove(bg, "victim"); err != nil {
+		t.Fatal(err)
+	}
+	eventuallyDropped(t, sess)
+	n := sess.TakeNotice()
+	if !strings.Contains(n, "removed by the hostmaster") || strings.Contains(n, "expired while this host was disconnected") {
+		t.Fatalf("notice: %q", n)
+	}
+}
+
+func TestMirror401WithActiveAccountKeepsExistingNotice(t *testing.T) {
+	tb := newTestBroker(t)
+	sess := NewSession(tb.newClient(tb.user("steady")))
+	m := NewMirror(sess, fastCfg())
+	t.Cleanup(m.Stop)
+	tok, _ := sess.Ensure(bg)
+	sess.Client().CreateChannel(bg, tok, "h/me")
+	m.Refresh(bg)
+	tb.kill(tok) // as a reap would
+	eventuallyDropped(t, sess)
+	if n := sess.TakeNotice(); !strings.Contains(n, "expired while this host was disconnected") {
+		t.Fatalf("notice: %q", n)
+	}
+}
+
+func TestSendHittingThe401FirstStillGetsAccountNotice(t *testing.T) {
+	tb := newTestBroker(t)
+	a := newShimWith(t, tb, "hostA", tb.newClient(tb.user("victim")), nil, false)
+	b := newShimWith(t, tb, "hostB", tb.newClient(tb.user("friend")), nil, false)
+	out := a.mustOK("create_channel", map[string]any{"my_name": "alice"})
+	b.mustOK("join_channel", map[string]any{"channel_id": uuidRE.FindString(out), "my_name": "bob"})
+	a.eventually(func(s Snapshot) bool { return len(s.Channels) == 1 && s.Channels[0].State == protocol.StateConnected })
+	a.m.Stop() // the mirror cannot see the 401 first; the send does
+	if _, _, err := tb.store.Remove(bg, "victim"); err != nil {
+		t.Fatal(err)
+	}
+	text, isErr := a.call("send", map[string]any{"peer": "bob", "text": "hi"})
+	if !isErr || !strings.Contains(text, "removed by the hostmaster") || strings.Contains(text, "expired while this host was disconnected") {
+		t.Fatalf("send after removal: %v %q", isErr, text)
+	}
+	// And the peer sees peer_removed, naming the account.
+	b.eventually(func(s Snapshot) bool { return len(s.Channels) == 1 && s.Channels[0].State == protocol.StatePeerRemoved })
+	got := b.mustOK("read", nil)
+	if !strings.Contains(got, `kind="peer_removed"`) || !strings.Contains(got, `account="victim"`) {
+		t.Fatalf("peer read: %s", got)
 	}
 }

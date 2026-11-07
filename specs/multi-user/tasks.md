@@ -6,7 +6,7 @@
 > Design references (M1–M18) point to Architect.md.
 
 ### Layer: Protocol
-- [ ] Step 1: Create `internal/protocol/accounts.go`. Contents:
+- [x] Step 1: Create `internal/protocol/accounts.go`. Contents:
   - constants `DefaultMaxAccounts=5`, `MaxAccountsCeiling=1000`, `PendingLimit=5`, `PendingExpiry=2h`, `RetiredKeep=7*24h`;
   - account statuses (`active`, `pending`, `rejected`, `expired`, `removed`);
   - error codes (`registration_refused` (the only register refusal, M7), `account_limit` (approve only), `account_pending`, `account_rejected`, `account_expired`, `account_removed`, `forbidden`, `wrong_state`, `no_such_account`);
@@ -14,23 +14,23 @@
   - the request and response types for register, account, all admin routes and the control socket (API Contract).
 
   Done: `go build ./internal/protocol`.
-- [ ] Step 2: Modify `internal/protocol/protocol.go`:
+- [x] Step 2: Modify `internal/protocol/protocol.go`:
   - add `KindPeerRemoved` and `KindRegistrationPending`, and make both waking in `IsWaking`;
   - add `StatePeerRemoved`, `AdminHandle = "admin"` and `CodePeerRemoved`;
   - add `Message.FromAccount`, `Channel.PeerAccount`, `KnownPeer.Account`, `JoinChannelResponse.PeerAccount`, `CreateSessionResponse.Account`, `SyncResponse.AdminSubscribed` and `StatusReply.Subscribed` (M9, M11).
 
   Done: `go build ./internal/protocol`.
-- [ ] Step 3: Modify `internal/protocol/protocol_test.go`: table tests for `ValidName` (pattern, length 64, case, injection-like strings rejected) and `IsWaking` for the two new kinds. Done: `go test -race ./internal/protocol`.
+- [x] Step 3: Modify `internal/protocol/protocol_test.go`: table tests for `ValidName` (pattern, length 64, case, injection-like strings rejected) and `IsWaking` for the two new kinds. Done: `go test -race ./internal/protocol`.
 
 ### Layer: Identity and test helper
-- [ ] Step 4: Create `internal/identity/identity.go` (M13):
+- [x] Step 4: Create `internal/identity/identity.go` (M13):
   - `LoadOrCreateKey(path)`: ECDSA P-256, PKCS#8 PEM, `O_EXCL` 0600 on create; an existing invalid file is an error;
   - `SelfSignedCert(key, now)`: valid for 1 year;
   - `Fingerprint(cert)` and `FingerprintSPKI(der)`: `SHA256:` plus unpadded base64 of the SPKI hash;
   - `ServerTLSConfig(cert)`: TLS 1.3 minimum.
 
   Done: `go build ./internal/identity`.
-- [ ] Step 5: Create `internal/identity/identity_test.go`:
+- [x] Step 5: Create `internal/identity/identity_test.go`:
   - create, then reload gives the same key and fingerprint;
   - two certs from one key share a fingerprint;
   - the file mode is 0600;
@@ -38,10 +38,10 @@
   - the fingerprint format is right.
 
   Done: `go test -race ./internal/identity`.
-- [ ] Step 6: Create `internal/testutil/tlsserver.go`: `TLSServer(t, http.Handler) (*httptest.Server, pin string)`. It uses a fresh `identity` key and cert and must not import `broker` or `client`. Done: `go build ./internal/testutil`.
+- [x] Step 6: Create `internal/testutil/tlsserver.go`: `TLSServer(t, http.Handler) (*httptest.Server, pin string)`. It uses a fresh `identity` key and cert and must not import `broker` or `client`. Done: `go build ./internal/testutil`.
 
 ### Layer: Client-side broker file
-- [ ] Step 7: Create `internal/brokerfile/brokerfile.go` (M14):
+- [x] Step 7: Create `internal/brokerfile/brokerfile.go` (M14):
   - `Dir()`, from `AGENT_BUS_CONFIG_DIR`, then `XDG_CONFIG_HOME`, then `~/.config/agent-bus`;
   - `NormalizeURL`: defaults to `https://`, port 7700, refuses `http://`, strips the path, lowercases the host (Critic R2-N6);
   - `PathFor(url)` → `brokers/<host>_<port>.json`;
@@ -49,17 +49,17 @@
   - the `File` struct: `url`, `fingerprint`, `account`, `credential`, `hostmaster`.
 
   Done: `go build ./internal/brokerfile`.
-- [ ] Step 8: Create `internal/brokerfile/brokerfile_test.go`: URL normalisation table (including `http://` refused, IPv6 hosts, and a mixed-case host giving the same path as its lowercase form), directory precedence, round trip, modes, permissive-mode refusal, missing file. Done: `go test -race ./internal/brokerfile`.
+- [x] Step 8: Create `internal/brokerfile/brokerfile_test.go`: URL normalisation table (including `http://` refused, IPv6 hosts, and a mixed-case host giving the same path as its lowercase form), directory precedence, round trip, modes, permissive-mode refusal, missing file. Done: `go test -race ./internal/brokerfile`.
 
 ### Layer: Broker
-- [ ] Step 9: Modify `internal/broker/store.go` for migration 2 only (M2, Data Model):
+- [x] Step 9: Modify `internal/broker/store.go` for migration 2 only (M2, Data Model):
   - drop and recreate the five tables with their new columns, and create `accounts`, `retired` and `settings` and the indexes, all in one transaction;
   - set `user_version = 2`;
   - a v1 database migrates and a v2 database is left untouched;
   - add a `maxAccounts(tx)` helper that reads `settings` with the default.
 
   Done: `go vet ./internal/broker` compiles the non-test code.
-- [ ] Step 10: Modify `internal/broker/store.go` for account-owned sessions and removal reasons (M1, M8, M9, M11):
+- [x] Step 10: Modify `internal/broker/store.go` for account-owned sessions and removal reasons (M1, M8, M9, M11):
   - `CreateSession(ctx, accountID)` stores `account_id`;
   - `Tx.enqueue` gains a `fromAccount *string` argument next to `from`, and `member` carries `account` (M9, Critic R2-W2);
   - `removeMember(m, reason)` and `deleteSession(id, reason)`: with `removed`, a joined channel goes to state `removed` and the peer gets `peer_removed`; `peer_left` and `peer_removed` carry the leaving member's account;
@@ -68,7 +68,7 @@
   - `Store` holds the claim state from step 12 as a field.
 
   Done: compiles once step 12 exists, so check after step 12.
-- [ ] Step 11: Modify `internal/broker/channels.go` (M8, M9):
+- [x] Step 11: Modify `internal/broker/channels.go` (M8, M9):
   - `CreateChannel` and `JoinChannel` copy the session's account name into `members.account` and `peer_account`;
   - `held.from_account` and `inbox.from_account` are filled on send and on held delivery;
   - `JoinChannel` returns the peer's account, and its `peer_joined` event carries the joiner's account (Critic R2-W2);
@@ -77,14 +77,14 @@
   - `resolve` and `Leave` handle the `removed` state like `ended`.
 
   Done: compiles.
-- [ ] Step 12: Create `internal/broker/claim.go` (M4):
+- [x] Step 12: Create `internal/broker/claim.go` (M4):
   - a `claims` type with a mutex: `Issue(mode) string`, `Check(code) (mode, ok)` and `Consume()`, used under the mutex held across the store transaction;
   - base32 formatting with dashes, normalisation, constant-time hash compare;
   - the exported `(*Store).IssueClaim(ctx) (code, mode string, err error)` (M4), the single entry point used by `Run`, the control socket and the client/shim/e2e test harnesses;
   - an exported `(*Store).HasHostmaster(ctx)` that `Run` checks first: `Run` calls `IssueClaim` only when it is false, so a start never issues or logs a `recover`-mode code (M4, Critic R2-W6).
 
   Done: `go vet ./internal/broker` compiles.
-- [ ] Step 13: Create `internal/broker/accounts.go` (M1, M3, M6, M7, M10, M11):
+- [x] Step 13: Create `internal/broker/accounts.go` (M1, M3, M6, M7, M10, M11):
   - `Register(ctx, name, claimCode)`, with the admission order and the claim and recovery paths; the claim path also applies `ValidName` and the case-insensitive name-taken check (M7 step 2); every refusal is the same `registration_refused`, with the real reason logged at INFO, the name only when it passed `ValidName` and otherwise its length (M7, Critic R2-N7);
   - `AccountByCredential(ctx, cred)`, giving the status, including retired outcomes;
   - `SessionAccount` for the `POST /v1/sessions` auth path, with a 403 code per status;
@@ -95,22 +95,22 @@
   - enqueue `registration_pending` to `admin_sub` sessions on a new pending row.
 
   Done: compiles.
-- [ ] Step 14: Modify `internal/broker/sweeper.go`: each sweep runs pending expiry and retired pruning in their own transactions after channel expiry; reaping calls `deleteSession(id, left)`; `setDisconnected` passes the member's account to `enqueue` (M9). Done: compiles.
-- [ ] Step 15: Create `internal/broker/server_accounts.go`:
+- [x] Step 14: Modify `internal/broker/sweeper.go`: each sweep runs pending expiry and retired pruning in their own transactions after channel expiry; reaping calls `deleteSession(id, left)`; `setDisconnected` passes the member's account to `enqueue` (M9). Done: compiles.
+- [x] Step 15: Create `internal/broker/server_accounts.go`:
   - handlers for `POST /v1/register`, `GET /v1/account` (credential bearer) and every `/v1/admin/*` route;
   - an `adminAuth` wrapper that resolves the session, then requires the hostmaster before decoding the body (M10);
   - the remove and register handlers call `tracker.Forget` for every session ID the store reports deleted (M8);
   - each successful admin mutation and subscribe/unsubscribe logs one INFO line with action, target name and acting name, never a credential or code (M8).
 
   Done: compiles.
-- [ ] Step 16: Create `internal/broker/control.go` (M5):
+- [x] Step 16: Create `internal/broker/control.go` (M5):
   - `ListenControl(path, store, fingerprint, log)`: removes a stale socket (same probe rule as the wake socket), chmods 0600, and serves `RECOVER` and `FINGERPRINT` with a 5 s read deadline, one request per connection;
   - `ControlRequest(path, cmd)`, the client the CLI uses;
   - `RECOVER` does not log the code (it calls `Store.IssueClaim`);
   - a path longer than 100 bytes is a clear error (M5).
 
   Done: compiles.
-- [ ] Step 17: Modify `internal/broker/server.go`:
+- [x] Step 17: Modify `internal/broker/server.go`:
   - register the new routes;
   - `createSession` authenticates the credential and returns `account`;
   - add `Config.KeyPath` and `Config.ControlPath`, defaulting to the directory of `DBPath`;
@@ -118,16 +118,16 @@
   - the logging middleware still never logs bearer values, and labels the short hash `cred` instead of `session` on `POST /v1/sessions` and `GET /v1/account`.
 
   Done: `go vet ./internal/broker` compiles the non-test code.
-- [ ] Step 18: Modify `internal/broker/store_test.go`:
+- [x] Step 18: Modify `internal/broker/store_test.go`:
   - the test helper creates an active account and then a session;
   - v1→v2 migration on a seeded v1 file (data dropped, version 2);
   - v2 reopen is a no-op;
   - removal reason semantics.
 
   Done: compiles with the other broker tests.
-- [ ] Step 19: Modify `internal/broker/channels_test.go`: account fields on join, held delivery and known peers; `peer_joined` and `peer_left` rows carry the peer's `from_account`; `Send` to a removed channel → `peer_removed`; leave on a removed channel. Done: compiles.
-- [ ] Step 20: Create `internal/broker/claim_test.go`: format and normalisation, single use, re-issue invalidates the previous code, wrong and missing codes indistinguishable, constant-time path exercised. Done: compiles.
-- [ ] Step 21: Create `internal/broker/accounts_test.go`. Cases:
+- [x] Step 19: Modify `internal/broker/channels_test.go`: account fields on join, held delivery and known peers; `peer_joined` and `peer_left` rows carry the peer's `from_account`; `Send` to a removed channel → `peer_removed`; leave on a removed channel. Done: compiles.
+- [x] Step 20: Create `internal/broker/claim_test.go`: format and normalisation, single use, re-issue invalidates the previous code, wrong and missing codes indistinguishable, constant-time path exercised. Done: compiles.
+- [x] Step 21: Create `internal/broker/accounts_test.go`. Cases:
   - claim on an unclaimed broker;
   - two concurrent claims with the same code → exactly one hostmaster;
   - register without a code when unclaimed → `registration_refused`;
@@ -150,15 +150,15 @@
   - `SetMaxAccounts` bounds.
 
   Done: compiles.
-- [ ] Step 22: Modify `internal/broker/sweeper_test.go`: pending expiry writes `retired` `expired`, pruning after `RetiredKeep`, reaping still emits `peer_left` (not `peer_removed`). Done: compiles.
-- [ ] Step 23: Modify `internal/broker/server_test.go`:
+- [x] Step 22: Modify `internal/broker/sweeper_test.go`: pending expiry writes `retired` `expired`, pruning after `RetiredKeep`, reaping still emits `peer_left` (not `peer_removed`). Done: compiles.
+- [x] Step 23: Modify `internal/broker/server_test.go`:
   - the harness registers accounts through the store and uses credentials;
   - `POST /v1/sessions` without or with a bad credential → 401;
   - pending → 403 `account_pending`;
   - the logging middleware does not log credentials.
 
   Done: compiles.
-- [ ] Step 24: Create `internal/broker/server_accounts_test.go`:
+- [x] Step 24: Create `internal/broker/server_accounts_test.go`:
   - a non-hostmaster gets 403 `forbidden` on each admin route, before body validation;
   - the hostmaster flows over HTTP;
   - after `remove`, the removed account's session IDs are forgotten by the tracker (a `Touch` after it does not re-add them);
@@ -167,25 +167,25 @@
   - status codes match the API Contract.
 
   Done: compiles.
-- [ ] Step 25: Create `internal/broker/control_test.go`: `FINGERPRINT` reply; a `Run` start (or its start-time issue helper) on a store that has a hostmaster issues and logs no code, and on an unclaimed store logs exactly one `claim`-mode code; `RECOVER` when unclaimed (mode `claim`) and when claimed (mode `recover`); the issued code works once through `Register`; unknown command; socket mode 0600; stale socket replaced. Done: **Checkpoint A** — `go test -race ./internal/broker` passes.
+- [x] Step 25: Create `internal/broker/control_test.go`: `FINGERPRINT` reply; a `Run` start (or its start-time issue helper) on a store that has a hostmaster issues and logs no code, and on an unclaimed store logs exactly one `claim`-mode code; `RECOVER` when unclaimed (mode `claim`) and when claimed (mode `recover`); the issued code works once through `Register`; unknown command; socket mode 0600; stale socket replaced. Done: **Checkpoint A** — `go test -race ./internal/broker` passes.
 
 ### Layer: Client
-- [ ] Step 26: Create `internal/client/tls.go` (M13):
+- [x] Step 26: Create `internal/client/tls.go` (M13):
   - `pinnedTransport(pin)`: `InsecureSkipVerify` plus `VerifyConnection` comparing SPKI fingerprints, TLS 1.3 minimum;
   - `PinError{Expected, Got}`, `ErrNotPinned`;
   - `Probe(ctx, url) (fingerprint, error)`.
 
   Done: `go build ./internal/client`.
-- [ ] Step 27: Modify `internal/client/client.go`:
+- [x] Step 27: Modify `internal/client/client.go`:
   - `Config{BaseURL, Pin, Credential}` and `New(Config) (*Client, error)`, which refuses non-https URLs and an empty pin;
   - `CreateSession` sends the credential and returns the token and account;
   - `PinError` passes through `do` unwrapped (`errors.As`);
   - `APIError.Is` is unchanged.
 
   Done: `go build ./internal/client`.
-- [ ] Step 28: Create `internal/client/accounts.go`: `Register`, `AccountStatus` (credential bearer), `ListAccounts`, `Approve`, `Reject`, `Remove`, `SetMaxAccounts`, `SetAdminSubscription`. Done: `go build ./internal/client`.
-- [ ] Step 29: Modify `internal/client/client_test.go`: use `testutil.TLSServer` with the real broker handler and a registered account; existing cases keep passing. Done: compiles.
-- [ ] Step 30: Create `internal/client/tls_test.go`:
+- [x] Step 28: Create `internal/client/accounts.go`: `Register`, `AccountStatus` (credential bearer), `ListAccounts`, `Approve`, `Reject`, `Remove`, `SetMaxAccounts`, `SetAdminSubscription`. Done: `go build ./internal/client`.
+- [x] Step 29: Modify `internal/client/client_test.go`: use `testutil.TLSServer` with the real broker handler and a registered account; existing cases keep passing. Done: compiles.
+- [x] Step 30: Create `internal/client/tls_test.go`:
   - the right pin connects;
   - a wrong pin → `PinError` with both values, and no request reaches the handler (the handler records hits);
   - an empty pin is refused by `New`;
@@ -193,10 +193,10 @@
   - `Probe` returns the server fingerprint.
 
   Done: compiles.
-- [ ] Step 31: Create `internal/client/accounts_test.go`: each account and admin method against the real handler over TLS, with error codes mapped to `APIError`. Done: **Checkpoint B** — `go test -race ./internal/client` passes.
+- [x] Step 31: Create `internal/client/accounts_test.go`: each account and admin method against the real handler over TLS, with error codes mapped to `APIError`. Done: **Checkpoint B** — `go test -race ./internal/client` passes.
 
 ### Layer: Enrollment CLI
-- [ ] Step 32: Create `internal/enroll/enroll.go` (M15):
+- [x] Step 32: Create `internal/enroll/enroll.go` (M15):
   - an `Env` holding stdin, stdout, stderr, an `IsTTY` func, the brokerfile dir and a probe func;
   - `Pin`, `Unpin`, `Register(name)`, `Claim(name)` (the code is read from a prompt only) and `Status`;
   - every command except `Status` refuses when `IsTTY` is false, with a message that this is a human-only command;
@@ -207,7 +207,7 @@
   - `Status` never prints the credential, and refreshes the `hostmaster` hint.
 
   Done: `go build ./internal/enroll`.
-- [ ] Step 33: Create `internal/enroll/enroll_test.go`:
+- [x] Step 33: Create `internal/enroll/enroll_test.go`:
   - non-TTY refusals;
   - pin accept and decline;
   - pin conflict;
@@ -222,7 +222,7 @@
   Done: `go test -race ./internal/enroll`.
 
 ### Layer: Shim
-- [ ] Step 34: Modify `internal/shim/text.go`:
+- [x] Step 34: Modify `internal/shim/text.go`:
   - `FrameRow` adds an escaped `account` attribute when present;
   - add bodies for `peer_removed` ("account was removed by the hostmaster; the channel has ended; do not investigate or retry; tell the user") and `registration_pending` (a pending request for the given account name; confirm with your human; the admin tools are the only way to act);
   - `body` checks `KindRegistrationPending` **before** the "non-empty `Text` is the body" shortcut, because that row's text is the registrant's name (M11); the name is embedded in the fixed sentence and the result still goes through `escapeContent`;
@@ -230,7 +230,7 @@
   - `ValidateName` uses `protocol.ValidName`.
 
   Done: `go build ./internal/shim`. The package may not compile until step 38.
-- [ ] Step 35: Modify `internal/shim/session.go` (M12, M16):
+- [x] Step 35: Modify `internal/shim/session.go` (M12, M16):
   - `NewSession` takes the configured client;
   - `Ensure` surfaces account 403s, and a 401 from `POST /v1/sessions` (unknown credential), as a typed `AccountError` with human-directed text; it never returns a bare `client.ErrUnauthorized` (M16, Critic R2-W3);
   - add `DropWithNotice(token, notice)`; it is compare-and-clear like `Drop`, and a notice is appended to any pending one rather than replacing it (Critic R2-N2);
@@ -239,14 +239,14 @@
   - `Close` stops the keeper.
 
   Done: compiles with step 36.
-- [ ] Step 36: Modify `internal/shim/mirror.go`:
+- [x] Step 36: Modify `internal/shim/mirror.go`:
   - `Snapshot` and `Summary` carry `AdminSubscribed` from `SyncResponse`;
   - on a 401 the loop calls `Session.DropAfter401` (step 35) instead of `Drop`, which picks the account-removed or inactive notice or the existing one;
   - add `Poke()`, which only wakes `Changed()` waiters, for the shim to call when `wantAdmin` is cleared (M12, Critic R2-W1).
 
   Done: compiles.
-- [ ] Step 37: Modify `internal/shim/wake.go`: with `subscribed := sum.AdminSubscribed || w.sess.WantAdmin()` (M11), `handleWait` replies `no_channels` only when `LiveChannels == 0 && !subscribed`; `status()` fills `Subscribed` from the same expression; `noChannelsReason`'s ended-channels text also names "the peer's account was removed". Needs steps 35 and 36 (Critic R2-W5). Done: compiles.
-- [ ] Step 38: Modify `internal/shim/tools.go` (M16, M17):
+- [x] Step 37: Modify `internal/shim/wake.go`: with `subscribed := sum.AdminSubscribed || w.sess.WantAdmin()` (M11), `handleWait` replies `no_channels` only when `LiveChannels == 0 && !subscribed`; `status()` fills `Subscribed` from the same expression; `noChannelsReason`'s ended-channels text also names "the peer's account was removed". Needs steps 35 and 36 (Critic R2-W5). Done: compiles.
+- [x] Step 38: Modify `internal/shim/tools.go` (M16, M17):
   - `NewTools` takes an optional `setupErr` (missing file, pin or credential) that every tool returns, plus `hostmaster bool`;
   - `brokerErr` renders `PinError` (both fingerprints, "only the human can resolve this with `agent-bus unpin`/`pin`; do not run it yourself") and `AccountError`;
   - the setup error for a refused `http://` URL tells the human to change it to `https://` (Architect "Upgrade and Rollback");
@@ -257,7 +257,7 @@
   - `Register` adds the admin tools when `hostmaster` is set.
 
   Done: compiles with step 39.
-- [ ] Step 39: Create `internal/shim/admin.go` (M10, M12, M17):
+- [x] Step 39: Create `internal/shim/admin.go` (M10, M12, M17):
   - six tools: `admin_list_accounts`, `admin_approve{name}`, `admin_reject{name}`, `admin_remove{name}`, `admin_set_max_accounts{max}` and `admin_subscribe{subscribed}`;
   - descriptions carry the confirm-first, explicit-target and no-peer-requests rules;
   - results wrap account names as data;
@@ -265,15 +265,15 @@
   - the keeper goroutine re-creates the session and re-subscribes after a drop, with 1–60 s backoff, and stops on shutdown, on unsubscribe, or on an `AccountError` from `Ensure` (a 403, or a 401 from session creation) or a 403 from subscribe; then it clears `wantAdmin`, appends a notice saying the subscription could not be restored, and calls `Mirror.Poke` (M12, Critic R2-W1).
 
   Done: `go build ./internal/shim`.
-- [ ] Step 40: Modify `internal/shim/text_test.go`: the `account` attribute is escaped (quotes, `<`, `&`), the new kind bodies (a `registration_pending` row whose `Text` is the name renders the explanatory sentence containing that name, not the bare name), the closing-tag escape still holds. Done: compiles.
-- [ ] Step 41: Modify `internal/shim/session_test.go`:
+- [x] Step 40: Modify `internal/shim/text_test.go`: the `account` attribute is escaped (quotes, `<`, `&`), the new kind bodies (a `registration_pending` row whose `Text` is the name renders the explanatory sentence containing that name, not the bare name), the closing-tag escape still holds. Done: compiles.
+- [x] Step 41: Modify `internal/shim/session_test.go`:
   - the fake broker uses `testutil.TLSServer` with a pin and a credential;
   - account 403 → `AccountError`; a 401 from session creation → `AccountError`, not `client.ErrUnauthorized`;
   - `DropWithNotice` text, and a second notice is appended to a pending one;
   - the keeper hook is invoked after a drop only when `wantAdmin` is set.
 
   Done: compiles.
-- [ ] Step 42: Modify `internal/shim/mirror_test.go`:
+- [x] Step 42: Modify `internal/shim/mirror_test.go`:
   - TLS fake broker;
   - `AdminSubscribed` propagates;
   - a 401 combined with `AccountStatus=removed` gives the removed notice;
@@ -281,16 +281,16 @@
   - a `send` that hits the 401 before the mirror does still gets the account-removed notice (shared `DropAfter401`).
 
   Done: compiles.
-- [ ] Step 43: Modify `internal/shim/wake_test.go`: a subscribed session with no channels stays armed and wakes on `registration_pending`; a `WAIT` sent right after the session is dropped while `wantAdmin` is set stays armed (no `no_channels`); once `wantAdmin` is cleared it gets `no_channels`; a `WAIT` already armed only by `wantAdmin` returns `no_channels` (with the keeper's notice as reason) as soon as `wantAdmin` is cleared and `Poke` is called; `STATUS` carries `subscribed`. Done: compiles.
-- [ ] Step 44: Modify `internal/shim/wake_fixed_test.go` only if the changed constructors break it, and adapt the helpers. Done: compiles.
-- [ ] Step 45: Modify `internal/shim/tools_test.go`:
+- [x] Step 43: Modify `internal/shim/wake_test.go`: a subscribed session with no channels stays armed and wakes on `registration_pending`; a `WAIT` sent right after the session is dropped while `wantAdmin` is set stays armed (no `no_channels`); once `wantAdmin` is cleared it gets `no_channels`; a `WAIT` already armed only by `wantAdmin` returns `no_channels` (with the keeper's notice as reason) as soon as `wantAdmin` is cleared and `Poke` is called; `STATUS` carries `subscribed`. Done: compiles.
+- [x] Step 44: Modify `internal/shim/wake_fixed_test.go` only if the changed constructors break it, and adapt the helpers. Done: compiles.
+- [x] Step 45: Modify `internal/shim/tools_test.go`:
   - every tool returns the setup error when unconfigured, and the text says to restart the session after the command;
   - the pin-mismatch text names both fingerprints and forbids self-repair;
   - the join result includes the account;
   - admin tools are absent without the hostmaster hint and present with it.
 
   Done: compiles.
-- [ ] Step 46: Create `internal/shim/admin_test.go`:
+- [x] Step 46: Create `internal/shim/admin_test.go`:
   - each admin tool against a real broker handler over TLS;
   - a non-hostmaster credential with the hint set gets `forbidden` rendered;
   - empty or wildcard names are rejected before any broker call;
@@ -300,11 +300,11 @@
   Done: **Checkpoint C** — `go test -race ./internal/shim` passes.
 
 ### Layer: Stop hook
-- [ ] Step 47: Modify `internal/hook/hook.go`: the unarmed-wake reminder also fires when `st.Subscribed` is true and there are no live channels. Done: `go build ./internal/hook`.
-- [ ] Step 48: Modify `internal/hook/hook_test.go`: a subscribed, unarmed session gets the reminder; a subscribed, armed one does not. Done: `go test -race ./internal/hook`.
+- [x] Step 47: Modify `internal/hook/hook.go`: the unarmed-wake reminder also fires when `st.Subscribed` is true and there are no live channels. Done: `go build ./internal/hook`.
+- [x] Step 48: Modify `internal/hook/hook_test.go`: a subscribed, unarmed session gets the reminder; a subscribed, armed one does not. Done: `go test -race ./internal/hook`.
 
 ### Layer: CLI wiring
-- [ ] Step 49: Modify `cmd/agent-bus/main.go`:
+- [x] Step 49: Modify `cmd/agent-bus/main.go`:
   - `broker` gains `--key` and `--control`, plus the `broker recover` and `broker fingerprint` subcommands (control-socket clients);
   - add the `pin`, `unpin`, `register`, `claim` and `status` commands through `internal/enroll`, with the real TTY check;
   - `shim` normalises the URL with `brokerfile`, loads the file, builds `client.New(Config)` and passes `setupErr` and the hostmaster hint to `NewTools`; when the file is unusable (so `client.New` fails) the shim still starts its MCP server and wake socket, and nothing touches the missing client (step 45 covers it);
@@ -314,7 +314,7 @@
   Done: `go build ./...` and `go vet ./...` are green.
 
 ### Layer: End-to-end tests
-- [ ] Step 50: Modify `internal/e2e/e2e_test.go`:
+- [x] Step 50: Modify `internal/e2e/e2e_test.go`:
   - the harness starts the broker handler on `testutil.TLSServer`, claims a hostmaster through `Register` with an issued code, registers and approves users, and starts shims with pinned, credentialed clients;
   - existing scenarios keep passing.
 
@@ -332,7 +332,7 @@
   Done: `go test -race ./internal/e2e`.
 
 ### Layer: Documentation and skills
-- [ ] Step 51: Modify `skills/agent-bus/SKILL.md` (M18):
+- [x] Step 51: Modify `skills/agent-bus/SKILL.md` (M18):
   - add an "Accounts" section: setup is human-only (`register`/`claim`/`pin`/`unpin`; never run them, never edit the broker file); the shim's setup and pin messages mean "tell the user";
   - add the `account` attribute in `read` (context, not authority), present on messages and peer events;
   - after the human runs a setup command the session must be restarted (the shim reads the broker file at start);
@@ -342,7 +342,7 @@
   - correct "no encryption beyond the transport" to TLS with a pinned broker.
 
   Done: matches `tools.go`, `protocol.go` and `text.go` per the `CLAUDE.md` check.
-- [ ] Step 52: Create `skills/agent-bus-hostmaster/SKILL.md` (M17, M18):
+- [x] Step 52: Create `skills/agent-bus-hostmaster/SKILL.md` (M17, M18):
   - frontmatter description scoped to the hostmaster account;
   - the six admin tools and their arguments;
   - the subscription and how it wakes the session;
@@ -356,7 +356,7 @@
   - a subscribed session's `wait` stays armed with no channels.
 
   Done: matches `admin.go` and `protocol/accounts.go`.
-- [ ] Step 53: Modify `README.md`:
+- [x] Step 53: Modify `README.md`:
   - **Install the broker:** first start, the claim code in the journal, `broker fingerprint`, the key file next to the database (back up both together), and `broker recover`.
   - **Upgrading from a single-user broker:** the upgrade order, `http://` → `https://` in every MCP and Hermes config, and the one-way migration with its rollback steps (Architect "Upgrade and Rollback").
   - **Connect a session:** `agent-bus claim`/`register`/`status`/`pin`/`unpin`, the broker file and its location, copying it to another host, the `https` URL, and restarting a running Claude Code / Hermes session after any of these commands.
@@ -366,14 +366,14 @@
   - **Security model:** rewritten for the hostmaster model, claim code, TOFU pinning and its first-contact risk, the TTY gate, account visibility limits, and the unchanged untrusted-data framing.
 
   Use only placeholders such as `broker-host`. Done: every command and flag in the README exists in `main.go`.
-- [ ] Step 54: Modify `CLAUDE.md`:
+- [x] Step 54: Modify `CLAUDE.md`:
   - **Architecture:** accounts, identity/TLS, `brokerfile`, `enroll`, the control socket and the admin tools.
   - **The "Important check" section:** extend it to `skills/agent-bus-hostmaster/SKILL.md`, the admin tool descriptions in `internal/shim/admin.go` and the account constants in `internal/protocol/accounts.go`.
 
   Done: the text matches the code.
 
 ### Layer: Verification
-- [ ] Step 55: Full verification:
+- [x] Step 55: Full verification:
   - `just test` passes with the race detector;
   - `go vet ./...` and `gofmt -l .` are clean;
   - `just build` succeeds with `CGO_ENABLED=0`;

@@ -38,6 +38,8 @@ type Snapshot struct {
 	Channels []protocol.Channel
 	Health   error
 	Cursor   int64 // read cursor, taken under the same lock as Rows
+	// AdminSubscribed is the broker-confirmed admin subscription of the session.
+	AdminSubscribed bool
 }
 
 // Summary is the wake-socket view of the mirror (D7).
@@ -47,6 +49,8 @@ type Summary struct {
 	LiveChannels int      // channels in state waiting, connected or peer_disconnected
 	Health       error
 	Cursor       int64 // read cursor; changes after a read
+	// AdminSubscribed is the broker-confirmed admin subscription of the session.
+	AdminSubscribed bool
 }
 
 type refreshWaiter struct{ done chan error }
@@ -68,6 +72,7 @@ type Mirror struct {
 	rows     []protocol.Message
 	channels []protocol.Channel
 	health   error
+	adminSub bool
 
 	waiters    []*refreshWaiter
 	dropWaiter []*refreshWaiter   // waiters of a dropped loop, released once the notice is set
@@ -100,6 +105,7 @@ func (m *Mirror) Changed() <-chan struct{} {
 func (m *Mirror) resetLocked() {
 	m.cursor, m.after, m.version = 0, 0, 0
 	m.rows, m.channels, m.health = nil, nil, nil
+	m.adminSub = false
 }
 
 // releaseWaitersLocked completes every waiting Refresh with nil.
@@ -194,7 +200,18 @@ func (m *Mirror) Snapshot() Snapshot {
 		Channels: append([]protocol.Channel(nil), m.channels...),
 		Health:   m.health,
 		Cursor:   m.cursor,
+
+		AdminSubscribed: m.adminSub,
 	}
+}
+
+// Poke wakes everything waiting on Changed without changing any state. The
+// shim calls it when it clears the local admin intent, so a wait that was
+// armed only because of that intent re-evaluates (M12).
+func (m *Mirror) Poke() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.notifyLocked()
 }
 
 // Unread returns the unread rows and the loop generation that supplied them.
@@ -226,6 +243,7 @@ func (m *Mirror) Summary() Summary {
 	}
 	sum.Health = s.Health
 	sum.Cursor = s.Cursor
+	sum.AdminSubscribed = s.AdminSubscribed
 	return sum
 }
 
@@ -346,7 +364,7 @@ func (m *Mirror) loop(ctx context.Context, gen int64, token string) {
 		if err != nil {
 			if errors.Is(err, client.ErrUnauthorized) {
 				m.mu.Unlock()
-				m.sess.Drop(token) // stops this loop, empties the mirror, sets the notice
+				m.sess.DropAfter401(ctx, token) // stops this loop, empties the mirror, sets the notice
 				for _, w := range waiters {
 					w.done <- nil // only now: the notice is visible to whoever wakes
 				}
@@ -403,5 +421,6 @@ func (m *Mirror) applyLocked(resp protocol.SyncResponse) {
 	}
 	m.version = resp.Version
 	m.channels = resp.Channels
+	m.adminSub = resp.AdminSubscribed
 	m.health = nil
 }

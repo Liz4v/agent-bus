@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,7 +31,9 @@ import (
 	"github.com/Liz4v/agent-bus/internal/client"
 	"github.com/Liz4v/agent-bus/internal/hermeswake"
 	"github.com/Liz4v/agent-bus/internal/hook"
+	"github.com/Liz4v/agent-bus/internal/protocol"
 	"github.com/Liz4v/agent-bus/internal/shim"
+	"github.com/Liz4v/agent-bus/internal/testutil"
 	"github.com/Liz4v/agent-bus/internal/wait"
 )
 
@@ -44,39 +48,94 @@ type peer struct {
 	done  chan error
 }
 
-func startShim(t *testing.T, brokerURL, host string) *peer {
+// harness is a real broker handler behind TLS, with a claimed hostmaster.
+type harness struct {
+	t        *testing.T
+	store    *broker.Store
+	url, pin string
+	hits     atomic.Int64 // requests that reached the broker handler
+	bossCred string
+
+	mu    sync.Mutex
+	creds map[string]string // account name -> credential
+}
+
+func newHarness(t *testing.T) *harness {
 	t.Helper()
-	sess := shim.NewSession(client.New(brokerURL))
-	m := shim.NewMirror(sess, shim.MirrorConfig{SyncWait: 2 * time.Second, BackoffMin: 20 * time.Millisecond})
-	rt, err := os.MkdirTemp("", "e2e")
+	store, err := broker.OpenStore(filepath.Join(t.TempDir(), "e2e.db"), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(rt) })
-	w, err := shim.StartWake(m, sess, shim.WakeOptions{RuntimeDir: rt, Debounce: 100 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
+	t.Cleanup(func() { store.Close() })
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store.SetLogger(quiet)
+	h := &harness{t: t, store: store, creds: map[string]string{}}
+	inner := broker.NewServer(store, broker.NewTracker(nil), quiet).Handler()
+	ts, pin := testutil.TLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.hits.Add(1)
+		inner.ServeHTTP(w, r)
+	}))
+	h.url, h.pin = ts.URL, pin
+	// Claim the hostmaster through an issued code, as the real flow does.
+	code, mode, err := store.IssueClaim(bg)
+	if err != nil || mode != protocol.ClaimModeClaim {
+		t.Fatalf("issue claim: %q %v", mode, err)
 	}
-	t.Cleanup(w.Close)
-	tools := shim.NewTools(sess, m, func() (string, error) { return host, nil }, w)
-	srv := tools.NewMCPServer("e2e")
-	t1, t2 := mcp.NewInMemoryTransports()
-	p := &peer{t: t, host: host, wake: w, tools: tools, done: make(chan error, 1)}
-	go func() { p.done <- tools.Run(bg, srv, t1) }()
-	cs, err := mcp.NewClient(&mcp.Implementation{Name: "e2e-client", Version: "0"}, nil).Connect(bg, t2, nil)
-	if err != nil {
-		t.Fatal(err)
+	res, err := h.client("").Register(bg, "boss", code)
+	if err != nil || !res.Hostmaster {
+		t.Fatalf("claim: %+v %v", res, err)
 	}
-	p.cs = cs
-	t.Cleanup(func() { cs.Close() })
-	return p
+	h.bossCred = res.Credential
+	return h
+}
+
+func (h *harness) client(cred string) *client.Client {
+	h.t.Helper()
+	c, err := client.New(client.Config{BaseURL: h.url, Pin: h.pin, Credential: cred})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	h.t.Cleanup(c.CloseIdleConnections)
+	return c
+}
+
+// account returns the credential of an active account called name, creating
+// and approving it on first use.
+func (h *harness) account(name string) string {
+	h.t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if c, ok := h.creds[name]; ok {
+		return c
+	}
+	res, err := h.store.Register(bg, name, "")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := h.store.Approve(bg, name); err != nil {
+		h.t.Fatal(err)
+	}
+	h.creds[name] = res.Credential
+	return res.Credential
+}
+
+func startShim(t *testing.T, h *harness, host string) *peer {
+	t.Helper()
+	return startShimOpts(t, h, host, shim.WakeOptions{})
 }
 
 // startShimOpts is startShim with explicit wake options (nil RuntimeDir gets a
-// fresh short temp dir).
-func startShimOpts(t *testing.T, brokerURL, host string, opt shim.WakeOptions) *peer {
+// fresh short temp dir). The shim's account is "acct-<host>".
+func startShimOpts(t *testing.T, h *harness, host string, opt shim.WakeOptions) *peer {
 	t.Helper()
-	sess := shim.NewSession(client.New(brokerURL))
+	return startShimWith(t, h.client(h.account("acct-"+host)), host, opt, nil, false)
+}
+
+// startShimWith builds a shim around an explicit client, setup error and
+// hostmaster hint.
+func startShimWith(t *testing.T, c *client.Client, host string, opt shim.WakeOptions, setupErr error, hostmaster bool) *peer {
+	t.Helper()
+	sess := shim.NewSession(c)
 	m := shim.NewMirror(sess, shim.MirrorConfig{SyncWait: 2 * time.Second, BackoffMin: 20 * time.Millisecond})
 	if opt.RuntimeDir == "" {
 		rt, err := os.MkdirTemp("", "e2e")
@@ -92,7 +151,7 @@ func startShimOpts(t *testing.T, brokerURL, host string, opt shim.WakeOptions) *
 		t.Fatal(err)
 	}
 	t.Cleanup(w.Close)
-	tools := shim.NewTools(sess, m, func() (string, error) { return host, nil }, w)
+	tools := shim.NewTools(sess, m, func() (string, error) { return host, nil }, w, setupErr, hostmaster)
 	srv := tools.NewMCPServer("e2e")
 	t1, t2 := mcp.NewInMemoryTransports()
 	p := &peer{t: t, host: host, wake: w, tools: tools, done: make(chan error, 1)}
@@ -173,18 +232,10 @@ func runHook(t *testing.T, backgroundCmd string) string {
 }
 
 func TestEndToEnd(t *testing.T) {
-	store, err := broker.OpenStore(filepath.Join(t.TempDir(), "e2e.db"), nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { store.Close() })
-	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ts := httptest.NewServer(broker.NewServer(store, broker.NewTracker(nil), quiet).Handler())
-	t.Cleanup(ts.Close)
-
-	a := startShim(t, ts.URL, "hostA")
-	b := startShim(t, ts.URL, "hostB")
-	c := startShim(t, ts.URL, "hostC")
+	h := newHarness(t)
+	a := startShim(t, h, "hostA")
+	b := startShim(t, h, "hostB")
+	c := startShim(t, h, "hostC")
 
 	// 1. A creates a channel and sends by handle before anyone joins.
 	out := a.ok("create_channel", map[string]any{"my_name": "alice"})
@@ -326,14 +377,8 @@ func (f *fakeHermes) expectPosts(t *testing.T, n int, quiet time.Duration) {
 }
 
 func TestHermesWakeEndToEnd(t *testing.T) {
-	store, err := broker.OpenStore(filepath.Join(t.TempDir(), "e2e.db"), nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { store.Close() })
+	h := newHarness(t)
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ts := httptest.NewServer(broker.NewServer(store, broker.NewTracker(nil), quiet).Handler())
-	t.Cleanup(ts.Close)
 
 	fh := &fakeHermes{}
 	hs := httptest.NewServer(fh)
@@ -346,7 +391,7 @@ func TestHermesWakeEndToEnd(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(sockDir) })
 	sock := filepath.Join(sockDir, "agent-bus", "hermes.sock")
 
-	a := startShimOpts(t, ts.URL, "hostA", shim.WakeOptions{Socket: sock})
+	a := startShimOpts(t, h, "hostA", shim.WakeOptions{Socket: sock})
 	if a.wake.Path() != sock || a.wake.IndexPath() != "" {
 		t.Fatalf("fixed socket not used: %q %q", a.wake.Path(), a.wake.IndexPath())
 	}
@@ -372,7 +417,7 @@ func TestHermesWakeEndToEnd(t *testing.T) {
 	})
 
 	// A channel with a peer: the peer_joined event is the first wake, once.
-	b := startShim(t, ts.URL, "hostB")
+	b := startShim(t, h, "hostB")
 	out := a.ok("create_channel", map[string]any{"my_name": "alice"})
 	b.ok("join_channel", map[string]any{"channel_id": uuidRE.FindString(out), "my_name": "bob"})
 	fh.expectPosts(t, 1, 1500*time.Millisecond) // unread stays put: no second POST
@@ -391,8 +436,8 @@ func TestHermesWakeEndToEnd(t *testing.T) {
 	a.wake.Close()
 	a.cs.Close()
 	<-a.done
-	a2 := startShimOpts(t, ts.URL, "hostA", shim.WakeOptions{Socket: sock})
-	d := startShim(t, ts.URL, "hostD")
+	a2 := startShimOpts(t, h, "hostA", shim.WakeOptions{Socket: sock})
+	d := startShim(t, h, "hostD")
 	out = a2.ok("create_channel", map[string]any{"my_name": "alice"})
 	d.ok("join_channel", map[string]any{"channel_id": uuidRE.FindString(out), "my_name": "dan"})
 	fh.expectPosts(t, 4, 1500*time.Millisecond)
@@ -416,5 +461,229 @@ func TestHermesWakeEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(fh.bodies[1], `"hostB/bob"`) || !strings.Contains(fh.bodies[3], `"hostD/dan"`) {
 		t.Fatalf("labels missing: %v", fh.bodies)
+	}
+}
+
+func listTools(t *testing.T, p *peer) map[string]bool {
+	t.Helper()
+	res, err := p.cs.ListTools(bg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]bool{}
+	for _, tl := range res.Tools {
+		out[tl.Name] = true
+	}
+	return out
+}
+
+func TestAccountsUnauthenticatedPendingAndPinned(t *testing.T) {
+	h := newHarness(t)
+
+	// An unauthenticated client cannot create a session.
+	var ae *client.APIError
+	if _, _, err := h.client("").CreateSession(bg); !errors.As(err, &ae) || ae.Status != 401 {
+		t.Fatalf("no credential: %v", err)
+	}
+	if _, _, err := h.client("made-up-credential").CreateSession(bg); !errors.As(err, &ae) || ae.Status != 401 {
+		t.Fatalf("bad credential: %v", err)
+	}
+
+	// A pending user's shim reports "pending approval" and works after approval.
+	res, err := h.client("").Register(bg, "pendy", "")
+	if err != nil || res.Status != protocol.AccountPending {
+		t.Fatalf("register: %+v %v", res, err)
+	}
+	p := startShimWith(t, h.client(res.Credential), "hostP", shim.WakeOptions{}, nil, false)
+	text, isErr := p.call("create_channel", map[string]any{"my_name": "pendy"})
+	if !isErr || !strings.Contains(text, "waiting for the hostmaster's approval") {
+		t.Fatalf("pending shim: %v %s", isErr, text)
+	}
+	if _, err := h.store.Approve(bg, "pendy"); err != nil {
+		t.Fatal(err)
+	}
+	p.ok("create_channel", map[string]any{"my_name": "pendy"})
+
+	// A wrong pin is refused and no request reaches the broker.
+	before := h.hits.Load()
+	wrong, err := client.New(client.Config{BaseURL: h.url, Pin: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Credential: h.bossCred})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := startShimWith(t, wrong, "hostW", shim.WakeOptions{}, nil, false)
+	text, isErr = w.call("create_channel", map[string]any{"my_name": "w"})
+	if !isErr || !strings.Contains(text, "does not match the pinned") || !strings.Contains(text, h.pin) || !strings.Contains(text, "Do not run those commands yourself") {
+		t.Fatalf("wrong pin: %v %s", isErr, text)
+	}
+	if h.hits.Load() != before {
+		t.Fatalf("%d requests reached the broker through a wrong pin", h.hits.Load()-before)
+	}
+}
+
+func TestTwoUsersSeeEachOthersAccountAndAdminToolsAreHostmasterOnly(t *testing.T) {
+	h := newHarness(t)
+	a := startShimWith(t, h.client(h.account("alicia")), "hostA", shim.WakeOptions{}, nil, false)
+	b := startShimWith(t, h.client(h.account("bobby")), "hostB", shim.WakeOptions{}, nil, false)
+	out := a.ok("create_channel", map[string]any{"my_name": "alice"})
+	if join := b.ok("join_channel", map[string]any{"channel_id": uuidRE.FindString(out), "my_name": "bob"}); !strings.Contains(join, "account alicia") {
+		t.Fatalf("join: %s", join)
+	}
+	// The creator's peer_joined row already names the joiner's account.
+	a.readUntil(`kind="peer_joined"`, `account="bobby"`)
+	b.ok("send", map[string]any{"peer": "alice", "text": "hello there"})
+	a.readUntil("hello there", `from="hostB/bob" account="bobby"`)
+	a.ok("send", map[string]any{"peer": "bob", "text": "hi back"})
+	b.readUntil("hi back", `account="alicia"`)
+
+	// Ordinary users see no admin tools; the hostmaster does.
+	for _, n := range listToolsNames(listTools(t, a)) {
+		if strings.HasPrefix(n, "admin_") {
+			t.Fatalf("a non-hostmaster sees %s", n)
+		}
+	}
+	boss := startShimWith(t, h.client(h.bossCred), "hostM", shim.WakeOptions{}, nil, true)
+	if tools := listTools(t, boss); !tools["admin_approve"] || !tools["admin_subscribe"] || len(tools) != 12 {
+		t.Fatalf("hostmaster tools: %v", tools)
+	}
+}
+
+func listToolsNames(m map[string]bool) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func TestHostmasterRemovesAUserMidChannel(t *testing.T) {
+	h := newHarness(t)
+	boss := startShimWith(t, h.client(h.bossCred), "hostM", shim.WakeOptions{}, nil, true)
+	a := startShimWith(t, h.client(h.account("alicia")), "hostA", shim.WakeOptions{}, nil, false)
+	b := startShimWith(t, h.client(h.account("bobby")), "hostB", shim.WakeOptions{}, nil, false)
+	out := a.ok("create_channel", map[string]any{"my_name": "alice"})
+	b.ok("join_channel", map[string]any{"channel_id": uuidRE.FindString(out), "my_name": "bob"})
+	a.readUntil(`kind="peer_joined"`)
+	b.ok("send", map[string]any{"peer": "alice", "text": "before removal"})
+	a.readUntil("before removal")
+
+	// A's wait is armed; the hostmaster removes B.
+	waitOut := make(chan string, 1)
+	go func() {
+		var o, e bytes.Buffer
+		wait.Run(bg, a.wake.Path(), &o, &e)
+		waitOut <- o.String()
+	}()
+	time.Sleep(300 * time.Millisecond)
+	if text := boss.ok("admin_remove", map[string]any{"name": "bobby"}); !strings.Contains(text, "Removed account") {
+		t.Fatalf("remove: %s", text)
+	}
+	select {
+	case o := <-waitOut:
+		if !strings.Contains(o, "hostB/bob") {
+			t.Fatalf("wait output: %q", o)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("A was not woken by peer_removed")
+	}
+	got := a.readUntil(`kind="peer_removed"`, `account="bobby"`, "removed by the hostmaster")
+	if !strings.Contains(got, "do not investigate") && !strings.Contains(strings.ToLower(got), "do not investigate") {
+		t.Fatalf("peer_removed text: %s", got)
+	}
+	if text, isErr := a.call("send", map[string]any{"peer": "bob", "text": "anyone?"}); !isErr ||
+		!strings.Contains(text, "account was removed by the hostmaster") {
+		t.Fatalf("send after removal: %v %s", isErr, text)
+	}
+	// The removed user's shim reports that its account was removed.
+	text, isErr := b.call("create_channel", map[string]any{"my_name": "bob"})
+	if !isErr || !strings.Contains(text, "removed by the hostmaster") {
+		t.Fatalf("removed user's shim: %v %s", isErr, text)
+	}
+}
+
+func TestSubscribedHostmasterIsWokenByARegistrationAndApproves(t *testing.T) {
+	h := newHarness(t)
+	boss := startShimWith(t, h.client(h.bossCred), "hostM", shim.WakeOptions{}, nil, true)
+	boss.ok("admin_subscribe", map[string]any{"subscribed": true})
+
+	waitOut := make(chan string, 1)
+	go func() {
+		var o, e bytes.Buffer
+		wait.Run(bg, boss.wake.Path(), &o, &e) // no channels at all, yet armed
+		waitOut <- o.String()
+	}()
+	time.Sleep(400 * time.Millisecond)
+	select {
+	case o := <-waitOut:
+		t.Fatalf("wait returned early: %q", o)
+	default:
+	}
+	// The Stop hook agrees: a subscribed session needs its wake armed.
+	if out := runHook(t, "agent-bus wait --socket "+boss.wake.Path()); out != "" {
+		t.Fatalf("hook with an armed wait: %q", out)
+	}
+	if _, err := h.client("").Register(bg, "newbie", ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case o := <-waitOut:
+		if !strings.Contains(o, protocol.SystemSender) {
+			t.Fatalf("wait output: %q", o)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("the hostmaster was not woken by the registration")
+	}
+	got := boss.ok("read", nil)
+	if !strings.Contains(got, "newbie") || !strings.Contains(got, "Confirm with your human") {
+		t.Fatalf("read: %s", got)
+	}
+	if out := boss.ok("admin_approve", map[string]any{"name": "newbie"}); !strings.Contains(out, "Approved account") {
+		t.Fatalf("approve: %s", out)
+	}
+	if list := boss.ok("admin_list_accounts", nil); !strings.Contains(list, "<account-name>newbie</account-name>: active") {
+		t.Fatalf("after approval: %s", list)
+	}
+}
+
+func TestRecoveryThroughTheControlSocketReplacesTheHostmaster(t *testing.T) {
+	h := newHarness(t)
+	oldBoss := startShimWith(t, h.client(h.bossCred), "hostM", shim.WakeOptions{}, nil, true)
+	oldBoss.ok("admin_list_accounts", nil)
+
+	dir, err := os.MkdirTemp("", "ctl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	cs, err := broker.ListenControl(filepath.Join(dir, "c.sock"), h.store, h.pin, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cs.Close)
+	if fp, err := broker.ControlFingerprint(cs.Path()); err != nil || fp != h.pin {
+		t.Fatalf("fingerprint over the control socket: %q %v", fp, err)
+	}
+	r, err := broker.ControlRecover(cs.Path())
+	if err != nil || r.Mode != protocol.ClaimModeRecover {
+		t.Fatalf("recover: %+v %v", r, err)
+	}
+	res, err := h.client("").Register(bg, "boss2", r.ClaimCode)
+	if err != nil || !res.Hostmaster {
+		t.Fatalf("recovery claim: %+v %v", res, err)
+	}
+	// The old hostmaster is gone; the new one works.
+	st, err := h.client(h.bossCred).AccountStatus(bg)
+	if err != nil || st.Status != protocol.AccountRemoved || st.Hostmaster {
+		t.Fatalf("old hostmaster: %+v %v", st, err)
+	}
+	if text, isErr := oldBoss.call("admin_list_accounts", nil); !isErr || !strings.Contains(text, "removed by the hostmaster") {
+		t.Fatalf("old hostmaster shim: %v %s", isErr, text)
+	}
+	newBoss := startShimWith(t, h.client(res.Credential), "hostN", shim.WakeOptions{}, nil, true)
+	if out := newBoss.ok("admin_list_accounts", nil); !strings.Contains(out, "<account-name>boss2</account-name>: active, hostmaster") {
+		t.Fatalf("new hostmaster list: %s", out)
+	}
+	// The recovery code is single-use.
+	if _, err := h.client("").Register(bg, "boss3", r.ClaimCode); err == nil {
+		t.Fatal("a recovery code worked twice")
 	}
 }

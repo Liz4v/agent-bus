@@ -132,7 +132,7 @@ func run(env Env) error {
 			st.Count, labels(st.From)))
 	case st.Error != nil:
 		return nil // fail open: the broker is unreachable and nothing is unread locally
-	case st.LiveChannels > 0 && !st.Armed && !taskRunning:
+	case (st.LiveChannels > 0 || st.Subscribed) && !st.Armed && !taskRunning:
 		return emit(env, "agent-bus: wake is not armed; run the command from wake_command in the background so peers can wake this session.")
 	}
 	return nil

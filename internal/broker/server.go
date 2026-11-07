@@ -2,14 +2,17 @@ package broker
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/Liz4v/agent-bus/internal/identity"
 	"github.com/Liz4v/agent-bus/internal/protocol"
 	"github.com/Liz4v/agent-bus/internal/secret"
 )
@@ -31,9 +34,17 @@ func NewServer(store *Store, tracker *Tracker, log *slog.Logger) *Server {
 
 type authed func(w http.ResponseWriter, r *http.Request, session int64)
 
-// Handler returns the mux for the seven routes.
+// Handler returns the mux for the broker routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/register", s.register)
+	mux.HandleFunc("GET /v1/account", s.account)
+	mux.HandleFunc("GET /v1/admin/accounts", s.adminAuth(s.adminList))
+	mux.HandleFunc("POST /v1/admin/approve", s.adminAuth(s.adminApprove))
+	mux.HandleFunc("POST /v1/admin/reject", s.adminAuth(s.adminReject))
+	mux.HandleFunc("POST /v1/admin/remove", s.adminAuth(s.adminRemove))
+	mux.HandleFunc("POST /v1/admin/max-accounts", s.adminAuth(s.adminMaxAccounts))
+	mux.HandleFunc("POST /v1/admin/subscribe", s.adminAuth(s.adminSubscribe))
 	mux.HandleFunc("POST /v1/sessions", s.createSession)
 	mux.HandleFunc("DELETE /v1/sessions/self", s.auth(s.deleteSelf))
 	mux.HandleFunc("POST /v1/channels", s.auth(s.createChannel))
@@ -54,8 +65,9 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-// logging logs method, path, status and a short token hash. It never logs
-// bodies, tokens or channel IDs.
+// logging logs method, path, status and a short hash of the bearer value. It
+// never logs bodies, tokens, credentials or channel IDs. On the routes
+// authenticated by the account credential the hash is labelled "cred".
 func (s *Server) logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -63,7 +75,11 @@ func (s *Server) logging(next http.Handler) http.Handler {
 		next.ServeHTTP(sw, r)
 		attrs := []any{"method", r.Method, "path", r.URL.Path, "status", sw.status, "dur", time.Since(start).Round(time.Millisecond)}
 		if tok := bearer(r); tok != "" {
-			attrs = append(attrs, "session", secret.Short(tok))
+			key := "session"
+			if (r.Method == http.MethodPost && r.URL.Path == "/v1/sessions") || (r.Method == http.MethodGet && r.URL.Path == "/v1/account") {
+				key = "cred"
+			}
+			attrs = append(attrs, key, secret.Short(tok))
 		}
 		s.log.Info("request", attrs...)
 	})
@@ -134,14 +150,25 @@ func (s *Server) decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
+// createSession authenticates the account credential and opens a session.
 func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
-	token, id, err := s.store.CreateSession(r.Context())
+	cred := bearer(r)
+	if cred == "" {
+		s.writeErr(w, r, ErrBadCredential)
+		return
+	}
+	accountID, account, err := s.store.SessionAccount(r.Context(), cred)
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	token, id, err := s.store.CreateSession(r.Context(), accountID)
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
 	}
 	s.tracker.Touch(id)
-	s.writeJSON(w, http.StatusCreated, protocol.CreateSessionResponse{SessionToken: token})
+	s.writeJSON(w, http.StatusCreated, protocol.CreateSessionResponse{SessionToken: token, Account: account})
 }
 
 func (s *Server) deleteSelf(w http.ResponseWriter, r *http.Request, session int64) {
@@ -171,12 +198,12 @@ func (s *Server) joinChannel(w http.ResponseWriter, r *http.Request, session int
 	if !s.decode(w, r, &req) {
 		return
 	}
-	handle, peer, err := s.store.JoinChannel(r.Context(), session, req.ChannelID, req.Label)
+	handle, peer, peerAccount, err := s.store.JoinChannel(r.Context(), session, req.ChannelID, req.Label)
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, protocol.JoinChannelResponse{Handle: handle, PeerLabel: peer})
+	s.writeJSON(w, http.StatusOK, protocol.JoinChannelResponse{Handle: handle, PeerLabel: peer, PeerAccount: peerAccount})
 }
 
 func (s *Server) send(w http.ResponseWriter, r *http.Request, session int64) {
@@ -260,24 +287,80 @@ func HTTPServer(addr string, h http.Handler, baseCtx context.Context) *http.Serv
 type Config struct {
 	Addr   string
 	DBPath string
-	Log    *slog.Logger
+	// KeyPath is the broker key file (default broker-key.pem next to DBPath).
+	KeyPath string
+	// ControlPath is the host-side control socket (default control.sock next
+	// to DBPath).
+	ControlPath string
+	Log         *slog.Logger
 	// SweepInterval overrides the sweeper period (default protocol.SweepInterval).
 	SweepInterval time.Duration
+	// Ready, if set, is called with the bound listen address once the broker
+	// accepts connections (used by tests).
+	Ready func(addr string)
 }
 
-// Run opens the store, initialises liveness tracking, starts the sweeper and
-// then serves until ctx is cancelled. Init runs before the sweeper starts and
-// before the listener accepts requests (D10).
+// DefaultKeyPath and DefaultControlPath return the defaults next to the
+// database.
+func DefaultKeyPath(dbPath string) string {
+	return filepath.Join(filepath.Dir(dbPath), "broker-key.pem")
+}
+
+func DefaultControlPath(dbPath string) string {
+	return filepath.Join(filepath.Dir(dbPath), "control.sock")
+}
+
+// announceClaim issues and logs a claim code, but only when no hostmaster
+// exists. A start with a hostmaster issues and logs nothing, so the journal
+// can never be used to take over an already claimed broker (M4). It reports
+// whether a code was issued.
+func announceClaim(ctx context.Context, store *Store, log *slog.Logger) (bool, error) {
+	has, err := store.HasHostmaster(ctx)
+	if err != nil || has {
+		return false, err
+	}
+	code, _, err := store.IssueClaim(ctx)
+	if err != nil {
+		return false, err
+	}
+	log.Warn("broker has no hostmaster; claim it with `agent-bus claim` using this one-time code (valid until the broker restarts)",
+		"claim_code", code)
+	return true, nil
+}
+
+// Run opens the store, loads the TLS identity, initialises liveness tracking,
+// starts the sweeper and the control socket and then serves HTTPS until ctx is
+// cancelled. Init runs before the sweeper starts and before the listener
+// accepts requests (D10).
 func Run(ctx context.Context, cfg Config) error {
 	log := cfg.Log
 	if log == nil {
 		log = slog.Default()
+	}
+	if cfg.KeyPath == "" {
+		cfg.KeyPath = DefaultKeyPath(cfg.DBPath)
+	}
+	if cfg.ControlPath == "" {
+		cfg.ControlPath = DefaultControlPath(cfg.DBPath)
+	}
+	key, err := identity.LoadOrCreateKey(cfg.KeyPath)
+	if err != nil {
+		return err
+	}
+	cert, err := identity.SelfSignedCert(key, time.Now())
+	if err != nil {
+		return err
+	}
+	fingerprint, err := identity.Fingerprint(cert)
+	if err != nil {
+		return err
 	}
 	store, err := OpenStore(cfg.DBPath, nil, nil)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	store.SetLogger(log)
 	tracker := NewTracker(nil)
 	if err := tracker.Init(ctx, store); err != nil {
 		return err
@@ -291,14 +374,28 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() { defer close(sweepDone); sweeper.Run(sweepCtx) }()
 	defer func() { stopSweep(); <-sweepDone }()
 
+	if _, err := announceClaim(ctx, store, log); err != nil {
+		return err
+	}
+	control, err := ListenControl(cfg.ControlPath, store, fingerprint, log)
+	if err != nil {
+		return err
+	}
+	defer control.Close()
+
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return err
 	}
+	tlsLn := tls.NewListener(ln, identity.ServerTLSConfig(cert))
 	srv := HTTPServer(cfg.Addr, NewServer(store, tracker, log).Handler(), ctx)
 	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(ln) }()
-	log.Info("broker listening", "addr", ln.Addr().String(), "db", cfg.DBPath)
+	go func() { errc <- srv.Serve(tlsLn) }()
+	log.Info("broker listening", "addr", ln.Addr().String(), "db", cfg.DBPath, "control", cfg.ControlPath)
+	log.Info("broker identity", "fingerprint", fingerprint)
+	if cfg.Ready != nil {
+		cfg.Ready(ln.Addr().String())
+	}
 	select {
 	case err := <-errc:
 		return err

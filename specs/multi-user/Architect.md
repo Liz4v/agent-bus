@@ -416,3 +416,16 @@ Known risks that Phase 3 (Critic) should scrutinise:
 - [x] No step requires modifying multiple unrelated files
 - [x] Parallelisation opportunities and file locks declared
 - [x] Notification/event needs considered for mutations affecting live state
+
+## Coder deviations
+
+Minor additions made while implementing; none changes a design decision (M1 to M18).
+
+- `Store.Register` runs the lazy pending expiry in its own committed transaction first (as the spec already required for `Approve`, `Reject` and `ListAccounts`), so a refused request does not roll the expiry back. Without it an approval past `PendingExpiry` returned `no_such_account` but left the row unretired.
+- `Store.CreateSession(ctx, accountID)` re-checks inside its transaction that the account exists and is active (`account_removed` / `account_pending` otherwise), closing the window between the credential check and the insert.
+- `Store.SetAdminSub` also refuses a non-hostmaster session (`forbidden`) at the store level, in addition to the handler gate.
+- `broker.Config.Ready` (a callback with the bound address) and the unexported `announceClaim` helper were added so tests can start `Run` on a free port and check the start-time claim code. `Store.SetLogger` and `Store.HasHostmaster` were added; the store logs registration refusals and recovery itself.
+- `client.Probe(ctx, url)` and `Client.CloseIdleConnections()` were added; `shim.CheckSetup` (in `tools.go`) resolves the broker URL and file into a client config, hostmaster hint or `*SetupError`; `enroll.IsTTYReader` backs the real TTY check in `main`.
+- The shim's keeper makes at least 1 s between attempt starts and also undoes a subscription it just made if the agent unsubscribed in the meantime.
+- The TTY gate is `ModeCharDevice` on stdin, as specified. `/dev/null` is also a character device and passes it, but then the typed confirmation cannot be answered, so nothing is changed.
+- One work-in-progress commit was made after Checkpoint A (the tree did not build as a whole at that point, see steps 26 to 49); the final commit completes the work.

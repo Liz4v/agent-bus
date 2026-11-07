@@ -37,6 +37,18 @@ func (tx *Tx) newHandle(session int64) (string, error) {
 	}
 }
 
+// sessionAccount returns the account name that owns a session, or
+// ErrUnauthorized if the session no longer exists.
+func (tx *Tx) sessionAccount(session int64) (string, error) {
+	var name string
+	err := tx.QueryRowContext(tx.ctx,
+		"SELECT a.name FROM sessions s JOIN accounts a ON a.id = s.account_id WHERE s.id = ?", session).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrUnauthorized
+	}
+	return name, err
+}
+
 // CreateChannel makes a new open channel with the caller as its only member.
 func (s *Store) CreateChannel(ctx context.Context, session int64, label string) (channelID, handle string, err error) {
 	if !protocol.ValidLabel(label) {
@@ -50,12 +62,16 @@ func (s *Store) CreateChannel(ctx context.Context, session int64, label string) 
 			return err
 		}
 		cid, _ := res.LastInsertId()
+		account, err := tx.sessionAccount(session)
+		if err != nil {
+			return err
+		}
 		handle, err = tx.newHandle(session)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, "INSERT INTO members(channel_id, session_id, label, handle) VALUES(?,?,?,?)",
-			cid, session, label, handle); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO members(channel_id, session_id, label, handle, account) VALUES(?,?,?,?,?)",
+			cid, session, label, handle, account); err != nil {
 			return err
 		}
 		return tx.bump(session)
@@ -67,7 +83,7 @@ func (s *Store) CreateChannel(ctx context.Context, session int64, label string) 
 }
 
 // JoinChannel adds the caller as the second member of an open channel.
-func (s *Store) JoinChannel(ctx context.Context, session int64, channelID, label string) (handle, peerLabel string, err error) {
+func (s *Store) JoinChannel(ctx context.Context, session int64, channelID, label string) (handle, peerLabel, peerAccount string, err error) {
 	err = s.update(ctx, func(tx *Tx) error {
 		// 1. bad_label depends only on the request.
 		if !protocol.ValidLabel(label) {
@@ -85,8 +101,8 @@ func (s *Store) JoinChannel(ctx context.Context, session int64, channelID, label
 		}
 		var creator member
 		if err := tx.QueryRowContext(ctx,
-			"SELECT id, channel_id, session_id, label, handle FROM members WHERE channel_id = ?", cid).
-			Scan(&creator.id, &creator.channelID, &creator.sessionID, &creator.label, &creator.handle); err != nil {
+			"SELECT id, channel_id, session_id, label, handle, account FROM members WHERE channel_id = ?", cid).
+			Scan(&creator.id, &creator.channelID, &creator.sessionID, &creator.label, &creator.handle, &creator.account); err != nil {
 			return err
 		}
 		// 3. same session or same label.
@@ -110,16 +126,20 @@ WHERE m.session_id = ? AND m.peer_label = ? AND c.state = 'joined' LIMIT 1`, c.s
 			}
 		}
 		// 5. join.
+		account, err := tx.sessionAccount(session)
+		if err != nil {
+			return err
+		}
 		handle, err = tx.newHandle(session)
 		if err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO members(channel_id, session_id, label, handle, peer_label) VALUES(?,?,?,?,?)",
-			cid, session, label, handle, creator.label); err != nil {
+			"INSERT INTO members(channel_id, session_id, label, handle, peer_label, account, peer_account) VALUES(?,?,?,?,?,?,?)",
+			cid, session, label, handle, creator.label, account, creator.account); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE members SET peer_label = ? WHERE id = ?", label, creator.id); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE members SET peer_label = ?, peer_account = ? WHERE id = ?", label, account, creator.id); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, "UPDATE channels SET state = 'joined' WHERE id = ?", cid); err != nil {
@@ -127,8 +147,8 @@ WHERE m.session_id = ? AND m.peer_label = ? AND c.state = 'joined' LIMIT 1`, c.s
 		}
 		// Held rows get their inbox IDs only now (I1), in their original order.
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO inbox(session_id, handle, from_label, kind, text, at)
-SELECT ?, ?, from_label, 'text', text, at FROM held WHERE channel_id = ? ORDER BY id`,
+INSERT INTO inbox(session_id, handle, from_label, from_account, kind, text, at)
+SELECT ?, ?, from_label, from_account, 'text', text, at FROM held WHERE channel_id = ? ORDER BY id`,
 			session, handle, cid); err != nil {
 			return err
 		}
@@ -138,13 +158,13 @@ SELECT ?, ?, from_label, 'text', text, at FROM held WHERE channel_id = ? ORDER B
 		if err := tx.bump(session); err != nil {
 			return err
 		}
-		peerLabel = creator.label
-		return tx.enqueue(creator.sessionID, creator.handle, &label, protocol.KindPeerJoined, "")
+		peerLabel, peerAccount = creator.label, creator.account
+		return tx.enqueue(creator.sessionID, creator.handle, &label, &account, protocol.KindPeerJoined, "")
 	})
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	return handle, peerLabel, nil
+	return handle, peerLabel, peerAccount, nil
 }
 
 type resolved struct {
@@ -156,7 +176,7 @@ type resolved struct {
 // (D4). `to` is a full label (contains '/'), a channel handle, or a bare peer
 // name (the part of the label after the host).
 func (tx *Tx) resolve(session int64, to string) (resolved, error) {
-	const cols = `SELECT m.id, m.channel_id, m.session_id, m.label, m.handle, c.state, COALESCE(m.peer_label, '')
+	const cols = `SELECT m.id, m.channel_id, m.session_id, m.label, m.handle, m.account, c.state, COALESCE(m.peer_label, '')
 FROM members m JOIN channels c ON c.id = m.channel_id `
 	const order = ` ORDER BY (c.state = 'joined') DESC, m.id DESC`
 	scan := func(rows *sql.Rows) ([]resolved, []string, error) {
@@ -166,7 +186,7 @@ FROM members m JOIN channels c ON c.id = m.channel_id `
 		for rows.Next() {
 			var r resolved
 			var pl string
-			if err := rows.Scan(&r.id, &r.channelID, &r.sessionID, &r.label, &r.handle, &r.state, &pl); err != nil {
+			if err := rows.Scan(&r.id, &r.channelID, &r.sessionID, &r.label, &r.handle, &r.account, &r.state, &pl); err != nil {
 				return nil, nil, err
 			}
 			out = append(out, r)
@@ -224,6 +244,9 @@ func (tx *Tx) unknownPeer(session int64, to string) error {
 		if c.PeerLabel != nil {
 			kp.Label = *c.PeerLabel
 		}
+		if c.PeerAccount != nil {
+			kp.Account = *c.PeerAccount
+		}
 		e.KnownPeers = append(e.KnownPeers, kp)
 	}
 	return e
@@ -251,20 +274,22 @@ func (s *Store) Send(ctx context.Context, session int64, to, text string) error 
 		}
 		switch r.state {
 		case "open":
-			_, err := tx.ExecContext(ctx, "INSERT INTO held(channel_id, from_label, text, at) VALUES(?,?,?,?)",
-				r.channelID, r.label, text, tx.now)
+			_, err := tx.ExecContext(ctx, "INSERT INTO held(channel_id, from_label, from_account, text, at) VALUES(?,?,?,?,?)",
+				r.channelID, r.label, r.account, text, tx.now)
 			return err
 		case "joined":
 			var other member
 			if err := tx.QueryRowContext(ctx,
-				"SELECT id, channel_id, session_id, label, handle FROM members WHERE channel_id = ? AND id <> ?",
-				r.channelID, r.id).Scan(&other.id, &other.channelID, &other.sessionID, &other.label, &other.handle); err != nil {
+				"SELECT id, channel_id, session_id, label, handle, account FROM members WHERE channel_id = ? AND id <> ?",
+				r.channelID, r.id).Scan(&other.id, &other.channelID, &other.sessionID, &other.label, &other.handle, &other.account); err != nil {
 				return err
 			}
-			from := r.label
-			return tx.enqueue(other.sessionID, other.handle, &from, protocol.KindText, text)
+			from, account := r.label, r.account
+			return tx.enqueue(other.sessionID, other.handle, &from, &account, protocol.KindText, text)
 		case "ended":
 			return ErrPeerLeft
+		case "removed":
+			return ErrPeerRemoved
 		default:
 			return ErrExpired
 		}
@@ -278,6 +303,6 @@ func (s *Store) Leave(ctx context.Context, session int64, to string) error {
 		if err != nil {
 			return err
 		}
-		return tx.removeMember(r.member)
+		return tx.removeMember(r.member, reasonLeft)
 	})
 }

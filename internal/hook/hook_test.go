@@ -286,3 +286,28 @@ func TestEveryErrorPathExitsZeroSilently(t *testing.T) {
 		t.Error("the reason should go to stderr")
 	}
 }
+
+func TestSubscribedUnarmedSessionGetsTheReminder(t *testing.T) {
+	// No live channels, but subscribed to admin notifications: the wake must be armed.
+	sock := statusServer(t, statusJSON(protocol.StatusReply{LiveChannels: 0, Subscribed: true, Armed: false, From: []string{}}))
+	r := execHook(t, `{}`, ancestry(t, sock, 0o700, "ppid-300"))
+	if !strings.Contains(r.context(t), "wake is not armed") {
+		t.Fatalf("%+v", r)
+	}
+	// A running wait task counts as armed here too.
+	if r := execHook(t, inputWithTasks("agent-bus wait --socket "+sock), nil); r.stdout != "" {
+		t.Fatalf("running wait task ignored: %+v", r)
+	}
+}
+
+func TestSubscribedArmedSessionGetsNoReminder(t *testing.T) {
+	sock := statusServer(t, statusJSON(protocol.StatusReply{LiveChannels: 0, Subscribed: true, Armed: true, From: []string{}}))
+	if r := execHook(t, `{}`, ancestry(t, sock, 0o700, "ppid-300")); r.stdout != "" || r.code != 0 {
+		t.Fatalf("%+v", r)
+	}
+	// Not subscribed and no channels: nothing to say either.
+	sock = statusServer(t, statusJSON(protocol.StatusReply{From: []string{}}))
+	if r := execHook(t, `{}`, ancestry(t, sock, 0o700, "ppid-301")); r.stdout != "" {
+		t.Fatalf("%+v", r)
+	}
+}

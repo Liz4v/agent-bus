@@ -117,7 +117,8 @@ func (sw *Sweeper) Run(ctx context.Context) {
 }
 
 // Sweep runs one pass: per session reconnect, disconnect, reap (in that
-// order), then the channel TTL expiry.
+// order), then the channel TTL expiry, pending-registration expiry and
+// retired-row pruning.
 func (sw *Sweeper) Sweep(ctx context.Context) error {
 	type sess struct {
 		id   int64
@@ -145,7 +146,13 @@ func (sw *Sweeper) Sweep(ctx context.Context) error {
 			return err
 		}
 	}
-	return sw.expireChannels(ctx)
+	if err := sw.expireChannels(ctx); err != nil {
+		return err
+	}
+	if err := sw.store.ExpirePending(ctx); err != nil {
+		return err
+	}
+	return sw.store.PruneRetired(ctx)
 }
 
 func (sw *Sweeper) sweepSession(ctx context.Context, id int64, disc sql.NullInt64) error {
@@ -189,7 +196,7 @@ func (sw *Sweeper) sweepSession(ctx context.Context, id int64, disc sql.NullInt6
 			if err != nil {
 				return err
 			}
-			return tx.deleteSession(id)
+			return tx.deleteSession(id, reasonLeft)
 		})
 		if err != nil {
 			return err
@@ -222,7 +229,7 @@ func (s *Store) setDisconnected(ctx context.Context, id int64, ts *int64, kind s
 		}
 		changed = true
 		rows, err := tx.QueryContext(ctx, `
-SELECT o.session_id, o.handle, m.label
+SELECT o.session_id, o.handle, m.label, m.account
 FROM members m
 JOIN channels c ON c.id = m.channel_id AND c.state = 'joined'
 JOIN members o ON o.channel_id = m.channel_id AND o.id <> m.id
@@ -231,13 +238,13 @@ WHERE m.session_id = ? ORDER BY m.id`, id)
 			return err
 		}
 		type target struct {
-			session       int64
-			handle, label string
+			session                int64
+			handle, label, account string
 		}
 		var targets []target
 		for rows.Next() {
 			var t target
-			if err := rows.Scan(&t.session, &t.handle, &t.label); err != nil {
+			if err := rows.Scan(&t.session, &t.handle, &t.label, &t.account); err != nil {
 				rows.Close()
 				return err
 			}
@@ -248,8 +255,8 @@ WHERE m.session_id = ? ORDER BY m.id`, id)
 			return err
 		}
 		for _, t := range targets {
-			label := t.label
-			if err := tx.enqueue(t.session, t.handle, &label, kind, ""); err != nil {
+			label, account := t.label, t.account
+			if err := tx.enqueue(t.session, t.handle, &label, &account, kind, ""); err != nil {
 				return err
 			}
 		}
@@ -300,7 +307,7 @@ func (s *Store) expireChannels(ctx context.Context) error {
 			if err := tx.QueryRowContext(ctx, "SELECT session_id, handle FROM members WHERE channel_id = ?", cid).Scan(&sess, &handle); err != nil {
 				return err
 			}
-			return tx.enqueue(sess, handle, nil, protocol.KindChannelExpired, "")
+			return tx.enqueue(sess, handle, nil, nil, protocol.KindChannelExpired, "")
 		})
 		if err != nil {
 			return err

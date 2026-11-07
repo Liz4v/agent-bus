@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,13 +45,43 @@ func openTestStore(t *testing.T) (*Store, *fakeClock) {
 	return s, clk
 }
 
-func newSession(t *testing.T, s *Store) int64 {
+var accountSeq atomic.Int64
+
+// addAccount inserts an account row with raw SQL (so store tests do not depend
+// on Register) and returns its ID and credential.
+func addAccount(t *testing.T, s *Store, name, status string, hostmaster bool) (int64, string) {
 	t.Helper()
-	_, id, err := s.CreateSession(context.Background())
+	cred := secret.NewToken()
+	hm := 0
+	if hostmaster {
+		hm = 1
+	}
+	res, err := s.db.Exec(
+		"INSERT INTO accounts(name, name_key, cred_hash, status, is_hostmaster, created_at) VALUES(?,?,?,?,?,?)",
+		name, strings.ToLower(name), secret.Hash(cred), status, hm, s.now().Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
+	id, _ := res.LastInsertId()
+	return id, cred
+}
+
+// newSession creates a fresh active account and a session owned by it.
+func newSession(t *testing.T, s *Store) int64 {
+	t.Helper()
+	id, _ := newSessionFor(t, s, fmt.Sprintf("user%d", accountSeq.Add(1)))
 	return id
+}
+
+// newSessionFor creates an active account called name and a session for it.
+func newSessionFor(t *testing.T, s *Store, name string) (session int64, account int64) {
+	t.Helper()
+	acc, _ := addAccount(t, s, name, protocol.AccountActive, false)
+	_, id, err := s.CreateSession(context.Background(), acc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id, acc
 }
 
 // rawJoined creates a joined channel between two sessions with raw SQL, so the
@@ -62,18 +94,30 @@ func rawJoined(t *testing.T, s *Store, a, b int64, la, lb string) (ma, mb member
 			return err
 		}
 		channel, _ = res.LastInsertId()
+		accounts := map[int64]string{}
+		for _, sess := range []int64{a, b} {
+			var n string
+			if err := tx.QueryRow("SELECT a.name FROM sessions s JOIN accounts a ON a.id = s.account_id WHERE s.id = ?", sess).Scan(&n); err != nil {
+				return err
+			}
+			accounts[sess] = n
+		}
 		for i, x := range []struct {
 			sess        int64
 			label, peer string
 			handle      string
 		}{{a, la, lb, "ch-a"}, {b, lb, la, "ch-b"}} {
-			r, err := tx.Exec("INSERT INTO members(channel_id, session_id, label, handle, peer_label) VALUES(?,?,?,?,?)",
-				channel, x.sess, x.label, x.handle, x.peer)
+			other := a
+			if x.sess == a {
+				other = b
+			}
+			r, err := tx.Exec("INSERT INTO members(channel_id, session_id, label, handle, peer_label, account, peer_account) VALUES(?,?,?,?,?,?,?)",
+				channel, x.sess, x.label, x.handle, x.peer, accounts[x.sess], accounts[other])
 			if err != nil {
 				return err
 			}
 			id, _ := r.LastInsertId()
-			m := member{id: id, channelID: channel, sessionID: x.sess, label: x.label, handle: x.handle}
+			m := member{id: id, channelID: channel, sessionID: x.sess, label: x.label, handle: x.handle, account: accounts[x.sess]}
 			if i == 0 {
 				ma = m
 			} else {
@@ -92,7 +136,7 @@ func enqueueText(t *testing.T, s *Store, session int64, text string) {
 	t.Helper()
 	from := "h/x"
 	err := s.update(context.Background(), func(tx *Tx) error {
-		return tx.enqueue(session, "ch-a", &from, protocol.KindText, text)
+		return tx.enqueue(session, "ch-a", &from, nil, protocol.KindText, text)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +166,7 @@ func TestMigrationIdempotent(t *testing.T) {
 	}
 	defer s.Close()
 	var v int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 1 {
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 2 {
 		t.Fatalf("user_version = %d, %v", v, err)
 	}
 	var n int
@@ -204,7 +248,7 @@ func TestSyncCommitOrderedVisibility(t *testing.T) {
 			for i := 0; i < 60; i++ {
 				from := "h/x"
 				if err := s.update(ctx, func(tx *Tx) error {
-					return tx.enqueue(a, "ch-a", &from, protocol.KindText, "x")
+					return tx.enqueue(a, "ch-a", &from, nil, protocol.KindText, "x")
 				}); err != nil && ctx.Err() == nil {
 					t.Error(err)
 					return
@@ -420,10 +464,10 @@ func TestInboxRowsOutliveMembershipAndChannel(t *testing.T) {
 	ma, mb, _ := rawJoined(t, s, a, b, "h/a", "h/b")
 	enqueueText(t, s, a, "queued before leave")
 	// Both sides remove their membership; the channel is deleted.
-	if err := s.update(ctx, func(tx *Tx) error { return tx.removeMember(mb) }); err != nil {
+	if err := s.update(ctx, func(tx *Tx) error { return tx.removeMember(mb, reasonLeft) }); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.update(ctx, func(tx *Tx) error { return tx.removeMember(ma) }); err != nil {
+	if err := s.update(ctx, func(tx *Tx) error { return tx.removeMember(ma, reasonLeft) }); err != nil {
 		t.Fatal(err)
 	}
 	var n int
@@ -488,5 +532,181 @@ func TestDSNPragmasOnEveryPooledConnection(t *testing.T) {
 	defer other.Close()
 	if _, err := other.ExecContext(ctx, "BEGIN IMMEDIATE"); err == nil {
 		t.Fatal("second writer got the lock: transactions are not immediate")
+	}
+}
+
+// schemaV1 is the pre-multi-user schema, to seed a v1 database.
+const schemaV1 = `
+CREATE TABLE sessions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_hash BLOB UNIQUE NOT NULL,
+  created_at INTEGER NOT NULL,
+  disconnected_at INTEGER NULL,
+  version INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE channels(
+  id INTEGER PRIMARY KEY,
+  id_hash BLOB UNIQUE NOT NULL,
+  created_at INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('open','joined','ended','expired')));
+CREATE TABLE members(
+  id INTEGER PRIMARY KEY,
+  channel_id INTEGER NOT NULL REFERENCES channels ON DELETE RESTRICT,
+  session_id INTEGER NOT NULL REFERENCES sessions ON DELETE RESTRICT,
+  label TEXT NOT NULL,
+  handle TEXT NOT NULL,
+  peer_label TEXT NULL,
+  UNIQUE(session_id, handle),
+  UNIQUE(channel_id, label));
+CREATE TABLE held(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id INTEGER NOT NULL REFERENCES channels ON DELETE CASCADE,
+  from_label TEXT NOT NULL,
+  text TEXT NOT NULL,
+  at INTEGER NOT NULL);
+CREATE TABLE inbox(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL REFERENCES sessions ON DELETE CASCADE,
+  handle TEXT NOT NULL,
+  from_label TEXT NULL,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL,
+  at INTEGER NOT NULL);
+`
+
+func seedV1(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, q := range []string{
+		schemaV1,
+		"INSERT INTO sessions(token_hash, created_at) VALUES(x'01', 1)",
+		"INSERT INTO channels(id_hash, created_at, state) VALUES(x'02', 1, 'open')",
+		"INSERT INTO members(channel_id, session_id, label, handle) VALUES(1, 1, 'h/a', 'ch-a')",
+		"INSERT INTO inbox(session_id, handle, kind, text, at) VALUES(1, 'ch-a', 'text', 'old', 1)",
+		"PRAGMA user_version = 1",
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("seed %q: %v", q, err)
+		}
+	}
+}
+
+func TestMigrationV1ToV2DropsDataAndSetsVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v1.db")
+	seedV1(t, path)
+	s, err := OpenStore(path, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var v int
+	s.db.QueryRow("PRAGMA user_version").Scan(&v)
+	if v != 2 {
+		t.Fatalf("user_version = %d, want 2", v)
+	}
+	for _, tbl := range []string{"sessions", "channels", "members", "held", "inbox", "accounts", "retired", "settings"} {
+		var n int
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM " + tbl).Scan(&n); err != nil || n != 0 {
+			t.Errorf("table %s: count %d, err %v (want present and empty)", tbl, n, err)
+		}
+	}
+	if has, err := s.HasHostmaster(bg); err != nil || has {
+		t.Fatalf("a migrated broker must start unclaimed: %v %v", has, err)
+	}
+}
+
+func TestMigrationV2ReopenIsNoOp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v2.db")
+	s, err := OpenStore(path, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addAccount(t, s, "keeper", protocol.AccountActive, true)
+	s.Close()
+	s, err = OpenStore(path, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if has, _ := s.HasHostmaster(bg); !has {
+		t.Fatal("reopening a v2 database dropped its accounts")
+	}
+}
+
+func TestFailedMigrationRollsBackFully(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad.db")
+	seedV1(t, path)
+	db, _ := sql.Open("sqlite", "file:"+path)
+	// A table the migration wants to create blocks it half-way through.
+	if _, err := db.Exec("CREATE TABLE retired(x)"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if s, err := OpenStore(path, nil, nil); err == nil {
+		s.Close()
+		t.Fatal("expected the migration to fail")
+	}
+	db, _ = sql.Open("sqlite", "file:"+path)
+	defer db.Close()
+	var v, n int
+	db.QueryRow("PRAGMA user_version").Scan(&v)
+	if v != 1 {
+		t.Fatalf("user_version = %d after a failed migration, want 1", v)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM inbox").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("old data not restored: %d, %v", n, err)
+	}
+}
+
+func TestRemoveMemberReasonRemoved(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	a, _ := newSessionFor(t, s, "alice")
+	b, _ := newSessionFor(t, s, "bob")
+	ma, _, _ := rawJoined(t, s, a, b, "h/a", "h/b")
+	if err := s.update(ctx, func(tx *Tx) error { return tx.removeMember(ma, reasonRemoved) }); err != nil {
+		t.Fatal(err)
+	}
+	r := sync0(t, s, b, protocol.SyncRequest{})
+	if len(r.Messages) != 1 || r.Messages[0].Kind != protocol.KindPeerRemoved ||
+		r.Messages[0].FromAccount == nil || *r.Messages[0].FromAccount != "alice" ||
+		r.Messages[0].FromLabel == nil || *r.Messages[0].FromLabel != "h/a" {
+		t.Fatalf("peer_removed row: %+v", r.Messages)
+	}
+	if len(r.Channels) != 1 || r.Channels[0].State != protocol.StatePeerRemoved {
+		t.Fatalf("channel list: %+v", r.Channels)
+	}
+}
+
+func TestRemoveMemberReasonLeftKeepsPeerLeft(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	a, _ := newSessionFor(t, s, "alice")
+	b, _ := newSessionFor(t, s, "bob")
+	ma, _, _ := rawJoined(t, s, a, b, "h/a", "h/b")
+	if err := s.update(ctx, func(tx *Tx) error { return tx.removeMember(ma, reasonLeft) }); err != nil {
+		t.Fatal(err)
+	}
+	r := sync0(t, s, b, protocol.SyncRequest{})
+	if len(r.Messages) != 1 || r.Messages[0].Kind != protocol.KindPeerLeft ||
+		r.Messages[0].FromAccount == nil || *r.Messages[0].FromAccount != "alice" {
+		t.Fatalf("peer_left row: %+v", r.Messages)
+	}
+	if r.Channels[0].State != protocol.StatePeerLeft {
+		t.Fatalf("state = %s", r.Channels[0].State)
+	}
+}
+
+func TestCreateSessionRequiresActiveAccount(t *testing.T) {
+	s, _ := openTestStore(t)
+	pending, _ := addAccount(t, s, "p", protocol.AccountPending, false)
+	if _, _, err := s.CreateSession(bg, pending); err == nil {
+		t.Fatal("a pending account got a session")
+	}
+	if _, _, err := s.CreateSession(bg, 9999); err == nil {
+		t.Fatal("a missing account got a session")
 	}
 }

@@ -32,3 +32,28 @@ func TestValidLabel(t *testing.T) {
 		}
 	}
 }
+
+func TestIsWakingAccountKinds(t *testing.T) {
+	for _, kind := range []string{KindPeerRemoved, KindRegistrationPending} {
+		if !IsWaking(kind) {
+			t.Errorf("IsWaking(%q) = false, want true", kind)
+		}
+	}
+}
+
+func TestValidName(t *testing.T) {
+	long64 := ""
+	for i := 0; i < 64; i++ {
+		long64 += "a"
+	}
+	for s, want := range map[string]bool{
+		"alice": true, "Alice": true, "a.b-c_d": true, "x": true, long64: true,
+		long64 + "a": false, "": false, "a b": false, "a/b": false, "*": false,
+		`a"b`: false, "a<b": false, "a\nb": false, "a&b": false, "é": false,
+		"</account-name>": false, "name\x00": false,
+	} {
+		if got := ValidName(s); got != want {
+			t.Errorf("ValidName(%q) = %v, want %v", s, got, want)
+		}
+	}
+}

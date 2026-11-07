@@ -32,7 +32,18 @@ func shortTempDir(t *testing.T) string {
 
 func newWakeEnv(t *testing.T, opt WakeOptions) *wakeEnv {
 	t.Helper()
-	me := newMirrorEnv(t, fastCfg())
+	return newWakeEnvFrom(t, opt, newMirrorEnv(t, fastCfg()))
+}
+
+// newHostmasterWakeEnv is a wake env whose shim session is the hostmaster's.
+func newHostmasterWakeEnv(t *testing.T, opt WakeOptions) *wakeEnv {
+	t.Helper()
+	tb := newTestBroker(t)
+	return newWakeEnvFrom(t, opt, newMirrorEnvFor(t, tb, fastCfg(), tb.newClient(tb.bossCred)))
+}
+
+func newWakeEnvFrom(t *testing.T, opt WakeOptions, me *mirrorEnv) *wakeEnv {
+	t.Helper()
 	if opt.RuntimeDir == "" {
 		opt.RuntimeDir = shortTempDir(t)
 	}
@@ -428,5 +439,76 @@ func TestWaitStaysArmedByDefault(t *testing.T) {
 	c.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
 	if line, err := bufio.NewReader(c).ReadString('\n'); err == nil {
 		t.Fatalf("wait replied without a message or a timeout option: %q", line)
+	}
+}
+
+func TestSubscribedSessionWithNoChannelsStaysArmedAndWakesOnRegistration(t *testing.T) {
+	e := newHostmasterWakeEnv(t, WakeOptions{})
+	tok, err := e.sess.Ensure(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.sess.Client().SetAdminSubscription(bg, tok, true); err != nil {
+		t.Fatal(err)
+	}
+	e.eventually(func(s Snapshot) bool { return s.AdminSubscribed })
+	if st := statusOf(t, e.w.Path()); !st.Subscribed || st.LiveChannels != 0 {
+		t.Fatalf("status: %+v", st)
+	}
+	c, br := dial(t, e.w.Path(), "WAIT")
+	noReply(t, c, br, 400*time.Millisecond) // no channels, but subscribed: still armed
+	if _, err := e.tb.store.Register(bg, "newbie", ""); err != nil {
+		t.Fatal(err)
+	}
+	line, err := readLine(c, br, 3*time.Second)
+	if err != nil {
+		t.Fatalf("not woken by the registration: %v", err)
+	}
+	var r protocol.WaitReply
+	json.Unmarshal([]byte(line), &r)
+	if r.Status != protocol.WaitPending || r.Count != 1 || len(r.From) != 1 || r.From[0] != protocol.SystemSender {
+		t.Fatalf("reply %+v", r)
+	}
+}
+
+func TestWaitDuringKeeperGapStaysArmedUntilIntentCleared(t *testing.T) {
+	e := newHostmasterWakeEnv(t, WakeOptions{})
+	tok, _ := e.sess.Ensure(bg)
+	e.sess.SetWantAdmin(true)
+	e.sess.Drop(tok) // the mirror is now reset to empty; the keeper is "re-establishing"
+
+	c, br := dial(t, e.w.Path(), "WAIT")
+	noReply(t, c, br, 400*time.Millisecond) // wantAdmin keeps it armed: no no_channels
+	if st := statusOf(t, e.w.Path()); !st.Subscribed || !st.Armed {
+		t.Fatalf("status: %+v", st)
+	}
+
+	// The keeper gives up: it clears the intent, leaves a notice and pokes.
+	e.sess.SetWantAdmin(false)
+	e.sess.AppendNotice("Your admin subscription could not be restored: test reason.")
+	e.m.Poke()
+	line, err := readLine(c, br, 3*time.Second)
+	if err != nil {
+		t.Fatalf("armed wait was not re-evaluated after the poke: %v", err)
+	}
+	var r protocol.WaitReply
+	json.Unmarshal([]byte(line), &r)
+	if r.Status != protocol.WaitNoChannels || !strings.Contains(r.Reason, "could not be restored") {
+		t.Fatalf("reply %+v", r)
+	}
+	// A new WAIT now gets no_channels at once.
+	if r := waitReply(t, e.w.Path(), 3*time.Second); r.Status != protocol.WaitNoChannels {
+		t.Fatalf("after clearing: %+v", r)
+	}
+}
+
+func TestUnsubscribedNoChannelsStillReplyNoChannels(t *testing.T) {
+	e := newHostmasterWakeEnv(t, WakeOptions{})
+	e.sess.Ensure(bg)
+	if r := waitReply(t, e.w.Path(), 3*time.Second); r.Status != protocol.WaitNoChannels {
+		t.Fatalf("%+v", r)
+	}
+	if st := statusOf(t, e.w.Path()); st.Subscribed {
+		t.Fatalf("status: %+v", st)
 	}
 }

@@ -191,7 +191,7 @@ func TestChannelTTLExpiry(t *testing.T) {
 		t.Fatal("held rows survived expiry")
 	}
 	wantCode(t, e.s.Send(bg, a, ha, "x"), ErrExpired)
-	_, _, err := e.s.JoinChannel(bg, b, id, "h/b")
+	_, _, _, err := e.s.JoinChannel(bg, b, id, "h/b")
 	wantCode(t, err, ErrNoOpen)
 	// The creator leaving removes the expired channel.
 	if err := e.s.Leave(bg, a, ha); err != nil {
@@ -343,5 +343,76 @@ func TestSweeperRunSweepsOnItsInterval(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not stop on cancel")
+	}
+}
+
+func TestSweepExpiresPendingAndPrunesRetired(t *testing.T) {
+	e := newSweepEnv(t)
+	code, _, err := e.s.IssueClaim(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.s.Register(bg, "boss", code); err != nil {
+		t.Fatal(err)
+	}
+	p, err := e.s.Register(bg, "waiting", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.clk.Advance(protocol.PendingExpiry + time.Second)
+	e.sweep()
+	var n int
+	e.s.db.QueryRow("SELECT COUNT(*) FROM accounts WHERE status = 'pending'").Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d pending rows survived the sweep", n)
+	}
+	var outcome string
+	if err := e.s.db.QueryRow("SELECT outcome FROM retired WHERE name = 'waiting'").Scan(&outcome); err != nil || outcome != "expired" {
+		t.Fatalf("retired outcome %q, %v", outcome, err)
+	}
+	if a, err := e.s.AccountByCredential(bg, p.Credential); err != nil || a.Status != protocol.AccountExpired {
+		t.Fatalf("status %+v %v", a, err)
+	}
+	e.clk.Advance(protocol.RetiredKeep + time.Second)
+	e.sweep()
+	e.s.db.QueryRow("SELECT COUNT(*) FROM retired").Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d retired rows survived pruning", n)
+	}
+	if _, err := e.s.AccountByCredential(bg, p.Credential); err != ErrBadCredential {
+		t.Fatalf("pruned credential: %v", err)
+	}
+}
+
+func TestReapEmitsPeerLeftNotPeerRemoved(t *testing.T) {
+	e := newSweepEnv(t)
+	a, b, _ := e.pair()
+	e.disconnectA(b) // a goes quiet; b stays seen
+	e.clk.Advance(protocol.DisconnectGrace + time.Second)
+	e.tr.Touch(b)
+	e.sweep()
+	if e.count(b, protocol.KindPeerLeft) != 1 || e.count(b, protocol.KindPeerRemoved) != 0 {
+		t.Fatalf("b rows: %v", e.kinds(b))
+	}
+	if e.state(b) != protocol.StatePeerLeft {
+		t.Fatalf("state %s", e.state(b))
+	}
+	_ = a
+}
+
+func TestDisconnectEventsCarryAccount(t *testing.T) {
+	e := newSweepEnv(t)
+	a, b, _ := e.pair()
+	_ = a
+	e.disconnectA(b)
+	r := sync0(t, e.s, b, protocol.SyncRequest{})
+	var found bool
+	for _, m := range r.Messages {
+		if m.Kind == protocol.KindPeerDisconnected {
+			found = m.FromAccount != nil && *m.FromAccount != ""
+		}
+	}
+	if !found {
+		t.Fatalf("peer_disconnected without from_account: %+v", r.Messages)
 	}
 }

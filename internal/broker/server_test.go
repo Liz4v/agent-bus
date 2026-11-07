@@ -3,18 +3,23 @@ package broker
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Liz4v/agent-bus/internal/identity"
 	"github.com/Liz4v/agent-bus/internal/protocol"
 )
 
@@ -39,15 +44,17 @@ type httpEnv struct {
 	ts   *httptest.Server
 	s    *Store
 	logs *syncBuffer
+	tr   *Tracker
 }
 
 func newHTTPEnv(t *testing.T) *httpEnv {
 	s, clk := openTestStore(t)
 	logs := &syncBuffer{}
-	srv := NewServer(s, NewTracker(clk.Now), slog.New(slog.NewTextHandler(logs, nil)))
+	tr := NewTracker(clk.Now)
+	srv := NewServer(s, tr, slog.New(slog.NewTextHandler(logs, nil)))
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return &httpEnv{t: t, ts: ts, s: s, logs: logs}
+	return &httpEnv{t: t, ts: ts, s: s, logs: logs, tr: tr}
 }
 
 func (e *httpEnv) do(token, method, path string, body any) (int, []byte) {
@@ -72,9 +79,18 @@ func (e *httpEnv) do(token, method, path string, body any) (int, []byte) {
 	return resp.StatusCode, out
 }
 
+var httpSeq atomic.Int64
+
+// credential creates an active account and returns its credential.
+func (e *httpEnv) credential() string {
+	e.t.Helper()
+	_, cred := addAccount(e.t, e.s, fmt.Sprintf("http%d", httpSeq.Add(1)), protocol.AccountActive, false)
+	return cred
+}
+
 func (e *httpEnv) session() string {
 	e.t.Helper()
-	code, b := e.do("", "POST", "/v1/sessions", struct{}{})
+	code, b := e.do(e.credential(), "POST", "/v1/sessions", struct{}{})
 	if code != 201 {
 		e.t.Fatalf("create session: %d %s", code, b)
 	}
@@ -451,7 +467,8 @@ func TestRunServesAndInitBeforeSweeper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := seed.CreateSession(bg); err != nil {
+	seedAcc, seedCred := addAccount(t, seed, "seed", protocol.AccountActive, false)
+	if _, _, err := seed.CreateSession(bg, seedAcc); err != nil {
 		t.Fatal(err)
 	}
 	seed.Close()
@@ -464,8 +481,11 @@ func TestRunServesAndInitBeforeSweeper(t *testing.T) {
 			Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	}()
 	var resp *http.Response
+	tlsClient := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	for i := 0; i < 100; i++ {
-		resp, err = http.Post("http://"+addr+"/v1/sessions", "application/json", strings.NewReader("{}"))
+		req, _ := http.NewRequest("POST", "https://"+addr+"/v1/sessions", strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer "+seedCred)
+		resp, err = tlsClient.Do(req)
 		if err == nil {
 			break
 		}
@@ -507,4 +527,177 @@ func TestRunFailsOnBadListenAddress(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run succeeded on an address already in use")
 	}
+}
+
+func TestCreateSessionCredentialAuth(t *testing.T) {
+	e := newHTTPEnv(t)
+	if code, body := e.do("", "POST", "/v1/sessions", struct{}{}); code != 401 || errCode(body) != protocol.CodeUnauthorized {
+		t.Fatalf("no credential: %d %s", code, body)
+	}
+	if code, body := e.do("not-a-credential", "POST", "/v1/sessions", struct{}{}); code != 401 {
+		t.Fatalf("bad credential: %d %s", code, body)
+	}
+	_, pend := addAccount(t, e.s, "waiting", protocol.AccountPending, false)
+	if code, body := e.do(pend, "POST", "/v1/sessions", struct{}{}); code != 403 || errCode(body) != protocol.CodeAccountPending {
+		t.Fatalf("pending: %d %s", code, body)
+	}
+	cred := e.credential()
+	code, body := e.do(cred, "POST", "/v1/sessions", struct{}{})
+	var r protocol.CreateSessionResponse
+	json.Unmarshal(body, &r)
+	if code != 201 || r.SessionToken == "" || r.Account == "" {
+		t.Fatalf("active: %d %s", code, body)
+	}
+	// A session token is not a credential, and a credential is not a session token.
+	if code, _ := e.do(r.SessionToken, "POST", "/v1/sessions", struct{}{}); code != 401 {
+		t.Fatalf("session token as credential: %d", code)
+	}
+	if code, _ := e.do(cred, "POST", "/v1/channels", protocol.CreateChannelRequest{Label: "h/a"}); code != 401 {
+		t.Fatalf("credential as session token: %d", code)
+	}
+}
+
+func TestLoggingNeverHoldsCredentialsAndLabelsThemCred(t *testing.T) {
+	e := newHTTPEnv(t)
+	cred := e.credential()
+	e.do(cred, "POST", "/v1/sessions", struct{}{})
+	e.do(cred, "GET", "/v1/account", nil)
+	tok := e.session()
+	e.do(tok, "POST", "/v1/sync", protocol.SyncRequest{})
+	e.do("", "POST", "/v1/register", protocol.RegisterRequest{Name: "someone", ClaimCode: "ABCDE-FGHIJ-KLMNO-PQRST"})
+	logs := e.logs.String()
+	for _, sec := range []string{cred, tok, "ABCDE-FGHIJ-KLMNO-PQRST"} {
+		if strings.Contains(logs, sec) {
+			t.Fatalf("log contains %q", sec)
+		}
+	}
+	if !strings.Contains(logs, "cred=") || !strings.Contains(logs, "session=") {
+		t.Fatalf("expected cred= and session= attributes:\n%s", logs)
+	}
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "/v1/sessions") && strings.Contains(line, "session=") && !strings.Contains(line, "DELETE") {
+			t.Fatalf("a credential-authenticated route is labelled session: %s", line)
+		}
+	}
+}
+
+func TestAnnounceClaimOnlyWhenUnclaimed(t *testing.T) {
+	s, _ := openTestStore(t)
+	logs := &syncBuffer{}
+	log := slog.New(slog.NewTextHandler(logs, nil))
+	issued, err := announceClaim(bg, s, log)
+	if err != nil || !issued {
+		t.Fatalf("unclaimed: %v %v", issued, err)
+	}
+	var code string
+	for _, f := range strings.Fields(logs.String()) {
+		if strings.HasPrefix(f, "claim_code=") {
+			code = strings.TrimPrefix(f, "claim_code=")
+		}
+	}
+	if !claimFormat.MatchString(code) {
+		t.Fatalf("logged code %q", code)
+	}
+	if strings.Count(logs.String(), "claim_code=") != 1 || !strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("log: %s", logs.String())
+	}
+	if _, err := s.Register(bg, "boss", code); err != nil {
+		t.Fatalf("the logged code does not work: %v", err)
+	}
+	// Claimed: a start issues and logs nothing.
+	logs2 := &syncBuffer{}
+	issued, err = announceClaim(bg, s, slog.New(slog.NewTextHandler(logs2, nil)))
+	if err != nil || issued || logs2.String() != "" {
+		t.Fatalf("claimed store: issued=%v err=%v log=%q", issued, err, logs2.String())
+	}
+}
+
+func TestRunServesTLSOnlyWithControlSocketAndLogsOneClaimCode(t *testing.T) {
+	dir, err := os.MkdirTemp("", "run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	logs := &syncBuffer{}
+	ready := make(chan string, 1)
+	ctx, cancel := context.WithCancel(bg)
+	done := make(chan error, 1)
+	cfg := Config{Addr: "127.0.0.1:0", DBPath: filepath.Join(dir, "a.db"), Ready: func(a string) { ready <- a },
+		Log: slog.New(slog.NewTextHandler(logs, nil)), SweepInterval: time.Hour}
+	go func() { done <- Run(ctx, cfg) }()
+	var addr string
+	select {
+	case addr = <-ready:
+	case err := <-done:
+		t.Fatalf("Run: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("broker did not start")
+	}
+	// Defaults sit next to the database; the key is private.
+	if fi, err := os.Stat(filepath.Join(dir, "broker-key.pem")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("key file: %v %v", fi, err)
+	}
+	// Plain HTTP is refused.
+	resp, err := http.Post("http://"+addr+"/v1/register", "application/json", strings.NewReader("{}"))
+	if err == nil {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 400 || !strings.Contains(string(b), "HTTP request to an HTTPS server") {
+			t.Fatalf("plain HTTP got %d %s", resp.StatusCode, b)
+		}
+	}
+	// TLS 1.3 with the identity's fingerprint, which the control socket reports.
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := identity.FingerprintSPKI(conn.ConnectionState().PeerCertificates[0].RawSubjectPublicKeyInfo)
+	conn.Close()
+	if got, err := ControlFingerprint(DefaultControlPath(cfg.DBPath)); err != nil || got != fp {
+		t.Fatalf("control fingerprint %q %v, served %q", got, err, fp)
+	}
+	if !strings.Contains(logs.String(), fp) {
+		t.Fatal("the fingerprint was not logged at start")
+	}
+	if n := strings.Count(logs.String(), "claim_code="); n != 1 {
+		t.Fatalf("%d claim codes logged at start of an unclaimed broker", n)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+	if _, err := os.Stat(DefaultControlPath(cfg.DBPath)); err == nil {
+		t.Fatal("the control socket was left behind")
+	}
+
+	// A second start with a hostmaster logs no code, and keeps the same key.
+	store, err := OpenStore(cfg.DBPath, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addAccount(t, store, "boss", protocol.AccountActive, true)
+	store.Close()
+	logs2 := &syncBuffer{}
+	ready2 := make(chan string, 1)
+	ctx2, cancel2 := context.WithCancel(bg)
+	cfg.Log, cfg.Ready = slog.New(slog.NewTextHandler(logs2, nil)), func(a string) { ready2 <- a }
+	go func() { done <- Run(ctx2, cfg) }()
+	select {
+	case addr = <-ready2:
+	case <-time.After(10 * time.Second):
+		t.Fatal("broker did not restart")
+	}
+	if strings.Contains(logs2.String(), "claim_code") {
+		t.Fatalf("a claimed broker logged a claim code:\n%s", logs2.String())
+	}
+	if !strings.Contains(logs2.String(), fp) {
+		t.Fatal("the fingerprint changed across a restart")
+	}
+	cancel2()
+	<-done
 }

@@ -12,10 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Liz4v/agent-bus/internal/brokerfile"
 	"github.com/Liz4v/agent-bus/internal/protocol"
 )
 
-// ErrUnauthorized means the broker no longer knows the session token.
+// ErrUnauthorized means the broker no longer knows the bearer value it was
+// sent (a session token, or for CreateSession and AccountStatus the credential).
 var ErrUnauthorized = errors.New("agent-bus: session unknown to the broker (expired or reaped)")
 
 // APIError is a broker error response. It maps the broker's error codes onto a
@@ -37,19 +39,40 @@ func (e *APIError) Is(target error) bool {
 	return target == ErrUnauthorized && e.Status == http.StatusUnauthorized
 }
 
-// Client talks to one broker. It is safe for concurrent use.
+// Config configures a client. BaseURL must be https and Pin is required; the
+// Credential may be empty for calls that need none (Register).
+type Config struct {
+	BaseURL    string
+	Pin        string // broker key fingerprint ("SHA256:...")
+	Credential string // account credential
+}
+
+// Client talks to one broker over a pinned TLS connection. It is safe for
+// concurrent use.
 type Client struct {
 	base string
+	cred string
 	http *http.Client
 }
 
-// New returns a client for the broker at baseURL (for example http://broker-host:7700).
-func New(baseURL string) *Client {
-	return &Client{base: strings.TrimRight(baseURL, "/"), http: &http.Client{}}
+// New returns a client for the broker in cfg. It refuses a non-https URL and
+// an empty pin (ErrNotPinned).
+func New(cfg Config) (*Client, error) {
+	base, err := brokerfile.NormalizeURL(cfg.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Pin == "" {
+		return nil, ErrNotPinned
+	}
+	return &Client{base: base, cred: cfg.Credential, http: &http.Client{Transport: pinnedTransport(cfg.Pin)}}, nil
 }
 
 // BaseURL returns the broker address.
 func (c *Client) BaseURL() string { return c.base }
+
+// CloseIdleConnections drops pooled connections.
+func (c *Client) CloseIdleConnections() { c.http.CloseIdleConnections() }
 
 func (c *Client) do(ctx context.Context, token, method, path string, in, out any, timeout time.Duration) error {
 	var body io.Reader
@@ -77,6 +100,10 @@ func (c *Client) do(ctx context.Context, token, method, path string, in, out any
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
+		var pe *PinError
+		if errors.As(err, &pe) {
+			return pe
+		}
 		if ctx.Err() != nil {
 			return fmt.Errorf("broker %s: %w", c.base, ctx.Err())
 		}
@@ -110,13 +137,14 @@ func (c *Client) do(ctx context.Context, token, method, path string, in, out any
 
 const callTimeout = 15 * time.Second
 
-// CreateSession registers a session and returns its token.
-func (c *Client) CreateSession(ctx context.Context) (string, error) {
+// CreateSession opens a session under the client's account credential and
+// returns its token and the account name.
+func (c *Client) CreateSession(ctx context.Context) (token, account string, err error) {
 	var out protocol.CreateSessionResponse
-	if err := c.do(ctx, "", "POST", "/v1/sessions", struct{}{}, &out, callTimeout); err != nil {
-		return "", err
+	if err := c.do(ctx, c.cred, "POST", "/v1/sessions", struct{}{}, &out, callTimeout); err != nil {
+		return "", "", err
 	}
-	return out.SessionToken, nil
+	return out.SessionToken, out.Account, nil
 }
 
 // DeleteSelf ends the session (clean exit).

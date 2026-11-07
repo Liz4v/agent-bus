@@ -2,6 +2,7 @@ package shim
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"strings"
 	"sync"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/Liz4v/agent-bus/internal/brokerfile"
+	"github.com/Liz4v/agent-bus/internal/client"
 	"github.com/Liz4v/agent-bus/internal/protocol"
 )
 
@@ -28,9 +31,16 @@ type shimEnv struct {
 
 func newShim(t *testing.T, tb *testBroker, host string) *shimEnv {
 	t.Helper()
-	sess := NewSession(tb.c)
+	return newShimWith(t, tb, host, tb.c, nil, false)
+}
+
+// newShimWith builds a shim around a specific client, setup error and
+// hostmaster hint.
+func newShimWith(t *testing.T, tb *testBroker, host string, c *client.Client, setupErr error, hostmaster bool) *shimEnv {
+	t.Helper()
+	sess := NewSession(c)
 	m := NewMirror(sess, fastCfg())
-	tools := NewTools(sess, m, func() (string, error) { return host, nil }, nil)
+	tools := NewTools(sess, m, func() (string, error) { return host, nil }, nil, setupErr, hostmaster)
 	srv := tools.NewMCPServer("test")
 	t1, t2 := mcp.NewInMemoryTransports()
 	e := &shimEnv{t: t, tb: tb, sess: sess, m: m, tools: tools, done: make(chan error, 1)}
@@ -531,7 +541,7 @@ func TestSendErrorsRenderedForTheAgent(t *testing.T) {
 	_, a, b := linked(t)
 	_ = b
 	text, isErr := a.call("send", map[string]any{"peer": "hostZ/nobody", "text": "x"})
-	if !isErr || !strings.Contains(text, "Known peers: hostB/bob [handle ch-") || !strings.Contains(text, "connected]") {
+	if !isErr || !strings.Contains(text, "Known peers: hostB/bob (account shared) [handle ch-") || !strings.Contains(text, "connected]") {
 		t.Fatalf("unknown peer: %v %s", isErr, text)
 	}
 	text, isErr = a.call("send", map[string]any{"peer": "hostB/bob", "text": ""})
@@ -544,4 +554,157 @@ func TestSendErrorsRenderedForTheAgent(t *testing.T) {
 	}
 	// the exact limit still goes through
 	a.mustOK("send", map[string]any{"peer": "hostB/bob", "text": strings.Repeat("x", protocol.MaxMessageBytes)})
+}
+
+func toolNames(t *testing.T, e *shimEnv) map[string]bool {
+	t.Helper()
+	res, err := e.cs.ListTools(bg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]bool{}
+	for _, tl := range res.Tools {
+		out[tl.Name] = true
+	}
+	return out
+}
+
+var adminToolNames = []string{"admin_list_accounts", "admin_approve", "admin_reject", "admin_remove", "admin_set_max_accounts", "admin_subscribe"}
+
+func TestAdminToolsOnlyWithHostmasterHint(t *testing.T) {
+	tb := newTestBroker(t)
+	plain := toolNames(t, newShimWith(t, tb, "hostA", tb.c, nil, false))
+	host := toolNames(t, newShimWith(t, tb, "hostA", tb.newClient(tb.bossCred), nil, true))
+	for _, n := range []string{"create_channel", "join_channel", "send", "read", "leave", "wake_command"} {
+		if !plain[n] || !host[n] {
+			t.Errorf("tool %s missing (plain %v, host %v)", n, plain[n], host[n])
+		}
+	}
+	for _, n := range adminToolNames {
+		if plain[n] {
+			t.Errorf("admin tool %s visible without the hostmaster hint", n)
+		}
+		if !host[n] {
+			t.Errorf("admin tool %s missing for the hostmaster", n)
+		}
+	}
+	if len(plain) != 6 || len(host) != 12 {
+		t.Errorf("tool counts: plain %d, host %d", len(plain), len(host))
+	}
+}
+
+func TestEveryToolReturnsTheSetupErrorWhenUnconfigured(t *testing.T) {
+	tb := newTestBroker(t)
+	_, _, setupErr := CheckSetup("broker-host:7700", t.TempDir())
+	if setupErr == nil {
+		t.Fatal("no setup error")
+	}
+	e := newShimWith(t, tb, "hostA", nil, setupErr, true) // even with the hint set
+	calls := map[string]map[string]any{
+		"create_channel": {"my_name": "alice"}, "join_channel": {"channel_id": "x", "my_name": "alice"},
+		"send": {"peer": "bob", "text": "hi"}, "read": nil, "leave": {"peer": "bob"}, "wake_command": nil,
+		"admin_list_accounts": nil, "admin_approve": {"name": "x"}, "admin_reject": {"name": "x"},
+		"admin_remove": {"name": "x"}, "admin_set_max_accounts": {"max": 3}, "admin_subscribe": {"subscribed": true},
+	}
+	for name, args := range calls {
+		text, isErr := e.call(name, args)
+		if !isErr || text != setupErr.Error() {
+			t.Errorf("%s: %v %q", name, isErr, text)
+		}
+	}
+	for _, want := range []string{"agent-bus register --broker https://broker-host:7700", "restart this Claude Code / Hermes session", "Do not run the command yourself"} {
+		if !strings.Contains(setupErr.Error(), want) {
+			t.Errorf("setup message lacks %q: %s", want, setupErr)
+		}
+	}
+	if tb.totalHits() != 0 {
+		t.Fatal("an unconfigured shim contacted the broker")
+	}
+}
+
+func TestCheckSetupCases(t *testing.T) {
+	dir := t.TempDir()
+	check := func(url string) (client.Config, bool, string) {
+		cfg, hm, err := CheckSetup(url, dir)
+		if err != nil {
+			var se *SetupError
+			if !errors.As(err, &se) {
+				t.Fatalf("not a SetupError: %T", err)
+			}
+			return cfg, hm, err.Error()
+		}
+		return cfg, hm, ""
+	}
+	if _, _, msg := check(""); !strings.Contains(msg, "no broker URL") {
+		t.Errorf("empty URL: %s", msg)
+	}
+	if _, _, msg := check("http://broker-host:7700"); !strings.Contains(msg, "https://") || !strings.Contains(msg, "plain http://") {
+		t.Errorf("http URL: %s", msg)
+	}
+	if _, _, msg := check("broker-host"); !strings.Contains(msg, "not set up") || !strings.Contains(msg, "register") {
+		t.Errorf("missing file: %s", msg)
+	}
+	brokerfile.Save(dir, brokerfile.File{URL: "broker-host"})
+	if _, _, msg := check("broker-host"); !strings.Contains(msg, "not pinned") || !strings.Contains(msg, "agent-bus pin") {
+		t.Errorf("unpinned: %s", msg)
+	}
+	brokerfile.Save(dir, brokerfile.File{URL: "broker-host", Fingerprint: "SHA256:x"})
+	if _, _, msg := check("broker-host"); !strings.Contains(msg, "no account") {
+		t.Errorf("no credential: %s", msg)
+	}
+	brokerfile.Save(dir, brokerfile.File{URL: "broker-host", Fingerprint: "SHA256:x", Account: "a", Credential: "c", Hostmaster: true})
+	cfg, hm, msg := check("Broker-Host:7700")
+	if msg != "" || !hm || cfg.Pin != "SHA256:x" || cfg.Credential != "c" || cfg.BaseURL != "https://broker-host:7700" {
+		t.Errorf("good file: %+v %v %q", cfg, hm, msg)
+	}
+}
+
+func TestPinMismatchMessageNamesBothFingerprintsAndForbidsSelfRepair(t *testing.T) {
+	tb := newTestBroker(t)
+	const wrong = "SHA256:WRONGWRONGWRONGWRONGWRONGWRONGWRONGWRONGWR"
+	c, err := client.New(client.Config{BaseURL: tb.ts.URL, Pin: wrong, Credential: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newShimWith(t, tb, "hostA", c, nil, false)
+	before := tb.totalHits()
+	text, isErr := e.call("create_channel", map[string]any{"my_name": "alice"})
+	if !isErr {
+		t.Fatalf("pin mismatch accepted: %s", text)
+	}
+	for _, want := range []string{wrong, tb.pin, "agent-bus unpin", "agent-bus pin", "restart this Claude Code / Hermes session", "Do not run those commands yourself"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("message lacks %q: %s", want, text)
+		}
+	}
+	if tb.totalHits() != before {
+		t.Fatal("a request reached the broker through a wrong pin")
+	}
+}
+
+func TestJoinResultAndKnownPeersNameTheAccount(t *testing.T) {
+	tb := newTestBroker(t)
+	a := newShimWith(t, tb, "hostA", tb.newClient(tb.user("alicia")), nil, false)
+	b := newShimWith(t, tb, "hostB", tb.newClient(tb.user("bobby")), nil, false)
+	out := a.mustOK("create_channel", map[string]any{"my_name": "alice"})
+	join := b.mustOK("join_channel", map[string]any{"channel_id": uuidRE.FindString(out), "my_name": "bob"})
+	if !strings.Contains(join, "hostA/alice") || !strings.Contains(join, "account alicia") {
+		t.Fatalf("join result: %s", join)
+	}
+	a.eventually(func(s Snapshot) bool { return len(s.Channels) == 1 && s.Channels[0].State == protocol.StateConnected })
+	// The creator's read shows the joiner's account on the peer_joined row.
+	got := a.mustOK("read", nil)
+	if !strings.Contains(got, `kind="peer_joined"`) || !strings.Contains(got, `account="bobby"`) {
+		t.Fatalf("creator read: %s", got)
+	}
+	b.mustOK("send", map[string]any{"peer": "alice", "text": "hello"})
+	a.eventually(func(s Snapshot) bool { return len(s.Rows) > 0 })
+	got = a.mustOK("read", nil)
+	if !strings.Contains(got, `account="bobby"`) || !strings.Contains(got, "hello") {
+		t.Fatalf("text read: %s", got)
+	}
+	text, _ := a.call("send", map[string]any{"peer": "nobody", "text": "x"})
+	if !strings.Contains(text, "(account bobby)") {
+		t.Fatalf("known peers: %s", text)
+	}
 }
