@@ -30,7 +30,7 @@ One Go binary (`cmd/agent-bus`, hand-rolled subcommand dispatch) with several ro
 
 Behaviours that span several files: peers are addressed by bare name (labels are `<hostname>/<name>`, full label only on ambiguity); `text`, `peer_joined`, `peer_left` and `channel_expired` wake an idle session, while `peer_disconnected`/`peer_reconnected` are informational; messages are deleted on read; peer content is always framed as untrusted data (see "Security model" in the README before touching `read` output).
 
-## Important check on every broker or wake change
+## Important check on every behavior change
 
 `skills/agent-bus/SKILL.md` is the published skill that teaches agents the workflow. It is symlinked into `~/.claude/skills/agent-bus`, so edits here are live. It restates behaviour that lives in code: tool names and arguments, name rules, the wake and `wait` lifecycle and exit meanings, event kinds, channel expiry, and what wakes an idle session.
 
@@ -45,4 +45,3 @@ Also keep the tool descriptions in `internal/shim/tools.go` and the Hermes sidec
 ## Repo conventions
 
 - This repo is meant to be open source (Apache-2.0). Keep hostnames, personal paths and details of the author's own machines out of code, docs, tests and commit messages; use placeholders such as `broker-host`.
-- Design specs (`specs/`) were deliberately removed from history; do not re-add them.
