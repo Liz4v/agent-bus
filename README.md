@@ -8,22 +8,22 @@ One Go binary, `agent-bus`, does four jobs:
 
 | Command | Runs on | Role |
 |---|---|---|
-| `agent-bus broker` | the Pi (Debian, systemd) | HTTP/JSON API with SQLite storage |
+| `agent-bus broker` | one host everyone can reach (e.g. a Raspberry Pi or small VPS) | HTTP/JSON API with SQLite storage |
 | `agent-bus shim` | every host, one per Claude Code session | stdio MCP server exposing the tools |
 | `agent-bus wait` | every host, started by the agent in the background | wakes an idle session when a message arrives |
 | `agent-bus hook stop` | every host, run by Claude Code | tells the agent about unread messages before it goes idle |
 
 Target client: the Claude Code CLI only.
 
-## Install the broker (Debian, systemd)
+## Install the broker (example: Linux with systemd)
 
 Build on the dev machine (pure Go, no cgo):
 
 ```sh
-just pi-arm64        # or: just pi-armv7
+just pi-arm64        # or: just pi-armv7 (other targets: plain `go build`)
 ```
 
-Install on the Pi:
+Install on the broker host (adjust to your distribution; the build targets are named for Raspberry Pi architectures, but any matching Linux host works):
 
 ```sh
 sudo install -m 0755 dist/agent-bus-linux-arm64 /usr/local/bin/agent-bus
@@ -34,14 +34,14 @@ sudo systemctl enable --now agent-bus
 
 The unit runs the broker as a dynamic unprivileged user, listening on `:7700` (all interfaces), with its database in `/var/lib/agent-bus/agent-bus.db`.
 
-To update later: `PI_HOST=user@pi PI_ARCH=arm64 just deploy`. It uploads to `/usr/local/bin/agent-bus.new` and renames it over the installed binary, because writing over the running binary fails with `ETXTBSY`. The ssh user needs write access to `/usr/local/bin` for the upload; the rename and the restart use `sudo`.
+To update later: `PI_HOST=user@broker-host PI_ARCH=arm64 just deploy`. It uploads to `/usr/local/bin/agent-bus.new` and renames it over the installed binary, because writing over the running binary fails with `ETXTBSY`. The ssh user needs write access to `/usr/local/bin` for the upload; the rename and the restart use `sudo`.
 
 ## Connect a Claude Code session
 
 On each host that has the binary installed (`go build ./cmd/agent-bus`, or `just build`):
 
 ```sh
-claude mcp add agent-bus -- agent-bus shim --broker http://<pi>:7700
+claude mcp add agent-bus -- agent-bus shim --broker http://<broker-host>:7700
 ```
 
 `AGENT_BUS_URL` works instead of `--broker`. If you start the shim through a wrapper script, the script must `exec` the shim, so that the shim stays a direct child of Claude Code (the Stop hook's process-ancestry fallback depends on it).
@@ -99,7 +99,7 @@ Addressing: `send` and `leave` take a `peer`: just the peer's name (the `my_name
 
 ### 1. Install the binary
 
-NixOS has no `/usr/local/bin`, so install per user and use this absolute path everywhere below:
+Where `/usr/local/bin` is not writable (for example on NixOS), install per user and use this absolute path everywhere below:
 
 ```sh
 just build
@@ -114,7 +114,7 @@ mcp_servers:
     command: /home/<you>/.local/bin/agent-bus
     args: [shim]
     env:
-      AGENT_BUS_URL: http://<pi>:7700
+      AGENT_BUS_URL: http://<broker-host>:7700
       AGENT_BUS_WAKE_SOCKET: /run/user/<uid>/agent-bus/hermes.sock
 ```
 
@@ -199,7 +199,7 @@ The sidecar logs state changes and HTTP status codes only. Success is HTTP 202; 
 
 ## Security model
 
-- The broker binds to all interfaces and has no accounts. Tailscale (or any network you trust) is the perimeter.
+- The broker binds to all interfaces and has no accounts. Put it behind a network you trust (a VPN such as Tailscale or WireGuard, a LAN, or a firewall allow-list); that network is the perimeter.
 - The **channel ID is the secret**. Anyone who holds it can join an open channel, and only an open channel. Every send and read needs the session token, which stays inside the shim and never reaches the agent.
 - The broker stores only SHA-256 hashes of channel IDs and session tokens, and logs only short hash prefixes. A leaked database file yields no joinable channels and no usable sessions.
 - Joining anything but an open channel gives one generic "no such open channel" error, so a leaked ID cannot be used to probe a channel's state.
@@ -216,5 +216,3 @@ Tool versions (Go, just) are pinned in `mise.toml`; run `mise install`.
 just test      # go test -race -cover ./... (needs a C compiler for the race detector)
 just build     # dist/agent-bus
 ```
-
-The design, decisions and test plan are in `specs/archive/2026-10-13-agent-bus-v1/`.
