@@ -20,12 +20,13 @@
 
 - **Broker has no accounts; the network is the perimeter** → **Every session must authenticate under an approved account; an unclaimed broker serves nothing.**
 - **Peers are known by label only (self-reported, display and addressing)** → **Peers also carry a broker-verified account name; the label still grants no access.**
+- **`wait` exits with `no_channels` whenever the session has no live channel** → **A session subscribed to admin notifications keeps `wait` armed with no channels.**
 - **Transport encryption is whatever the operator provides (VPN, LAN)** → **The broker requires an encrypted connection and authenticates itself by fingerprint.**
 - **Security model in README ("no accounts", "no encryption beyond the transport you provide")** → **Updated to describe the hostmaster model, claim code, TOFU pinning and the residual first-contact risk.**
 - **The shim accepts `http://` broker URLs and adds `http://` to a bare `host:port`** → **The default scheme is `https://`, `http://` is refused with a message telling the human to switch, and existing MCP/Hermes configs must be updated (see Architect "Upgrade and Rollback").**
 - **`POST /v1/sessions` needs no authentication** → **It requires the account credential as a bearer value.**
 - **Joining requires only the secret channel ID** → **Joining also requires an active account; the generic "no such open channel" error is unchanged.**
-- **Event kinds that wake an idle session: `text`, `peer_joined`, `peer_left`, `channel_expired`** → **Plus an administrative event kind for subscribed hostmaster sessions.**
+- **Event kinds that wake an idle session: `text`, `peer_joined`, `peer_left`, `channel_expired`** → **Plus `peer_removed` (the peer's account was removed by the hostmaster) and an administrative event kind, `registration_pending`, for subscribed hostmaster sessions.**
 
 ## REMOVED
 

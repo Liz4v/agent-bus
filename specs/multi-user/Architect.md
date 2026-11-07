@@ -55,6 +55,7 @@ New moving parts, each in its own file or package:
 - Every refusal that involves a claim code returns the single generic `registration_refused`. That covers a missing code on an unclaimed broker, a wrong code, a used code, and a code sent to a claimed broker with no recovery pending.
 - The claim code is the one secret the broker logs. This is documented as the residual risk.
 - Issuing goes through one exported method, `(*Store).IssueClaim(ctx) (code, mode string, err error)`, which picks the mode from whether a hostmaster exists. `Run` (start-time issue), the control socket (`RECOVER`) and tests in other packages (client, shim, e2e harnesses) all use it; the `claims` type itself stays unexported. *(Critic R1-B2.)*
+- `Run` calls `IssueClaim` only after checking that there is no hostmaster, so the start-time code is always mode `claim`. A `recover`-mode code is issued only through the control socket and is never logged; a start with a hostmaster logs no code at all. Otherwise anyone who can read the journal could replace the hostmaster after every restart. *(Critic R2-W6.)*
 
 **M5 — Host-side control socket for recovery and fingerprint.**
 - The broker listens on a Unix socket, default `<dir of --db>/control.sock`, mode 0600, inside the state directory. The state directory is `/var/lib/private/agent-bus` under `DynamicUser`, mode 0700, so only root and the broker's own user can reach it.
@@ -82,7 +83,7 @@ New moving parts, each in its own file or package:
 6. The active count is at or above `max_accounts` → `registration_refused`.
 7. Insert the pending row, then enqueue a `registration_pending` event to every session that has `admin_sub = 1` (only the hostmaster's sessions can have it).
 
-*User decision (Phase 2), which supersedes the Analyst's "clear reason" wording for name-taken and the limits:* the unauthenticated register endpoint returns one generic `registration_refused` for **every** refusal, so a stranger learns nothing about existing names or broker capacity. The broker logs the real reason at INFO (no credential, no code), so the hostmaster can see it in the journal. The CLI checks the name pattern locally before sending, so a malformed name still gets a precise message without any broker state being disclosed. The refusal message tells the registrant to try another name or ask the hostmaster.
+*User decision (Phase 2), which supersedes the Analyst's "clear reason" wording for name-taken and the limits:* the unauthenticated register endpoint returns one generic `registration_refused` for **every** refusal, so a stranger learns nothing about existing names or broker capacity. The broker logs the real reason at INFO (no credential, no code), so the hostmaster can see it in the journal. The requested name is logged only when it passed `ValidName`; an invalid name is logged as its byte length, so an unauthenticated caller cannot put arbitrary text (up to the 1 MiB body limit) into the journal. *(Critic R2-N7.)* The CLI checks the name pattern locally before sending, so a malformed name still gets a precise message without any broker state being disclosed. The refusal message tells the registrant to try another name or ask the hostmaster.
 
 `approve` re-checks the active cap (6) and returns `account_limit` to the authenticated hostmaster, so lowering the cap never lets an approval exceed it. `approve`, `reject` and `ListAccounts` run the lazy pending expiry (1) first in their own transaction, so a request past `PendingExpiry` that the sweeper has not reached yet is `no_such_account`, never approved. *(Critic R1-N1.)* The cap is a `settings` row. When the row is absent the cap is `DefaultMaxAccounts` (5). The valid range is `1..MaxAccountsCeiling` (1000).
 
@@ -106,6 +107,7 @@ New moving parts, each in its own file or package:
   - `KnownPeer.Account`
   - `JoinChannelResponse.PeerAccount`
   - `CreateSessionResponse.Account`
+- Events about a peer carry that peer's account too, not only text rows. `Tx.enqueue` takes the sender's account next to its label, and `peer_joined`, `peer_left`, `peer_removed`, `peer_disconnected` and `peer_reconnected` fill `inbox.from_account` from `members.account`. Without this a channel creator would learn who joined (`peer_joined`) without the joiner's account, and would see it only on the first text message. *(Critic R2-W2.)*
 - `read` adds an `account="…"` attribute to `<peer-message>`, escaped like the other attributes. The content stays untrusted exactly as today.
 - Account names never appear for channels the session is not a member of. There is no listing route for other users' sessions or channels.
 
@@ -131,7 +133,10 @@ New moving parts, each in its own file or package:
 **M12 — The shim keeps the subscription alive** (auto-restore confirmed by the user in Phase 2). The subscription belongs to the agent's session, which is the shim process. If the broker session is dropped (401 after a reap), the shim re-establishes it in the background when the agent had subscribed:
 - it re-runs `Ensure` and then subscribes again;
 - it backs off 1 s to 60 s between attempts;
-- it stops on shutdown, on unsubscribe, on a 403 (the account is no longer hostmaster, or no longer active), or on a 401 from `POST /v1/sessions` (the credential is unknown, e.g. its retired row was pruned). When it stops for a 401 or 403 it clears `wantAdmin`, so the wake socket can again answer `no_channels`, and the session notice says the subscription could not be restored and why. *(Critic R1-W3.)*
+- it stops on shutdown, on unsubscribe, on a 403 (the account is no longer hostmaster, or no longer active), or on a 401 from `POST /v1/sessions` (the credential is unknown, e.g. its retired row was pruned). When it stops for a 401 or 403 it clears `wantAdmin`, so the wake socket can again answer `no_channels`, and the session notice says the subscription could not be restored and why. *(Critic R1-W3.)* Both cases reach the keeper as an `AccountError` from `Ensure` (M16).
+- Clearing `wantAdmin` (here or in `admin_subscribe{subscribed:false}`) also wakes the mirror's change channel (`Mirror.Poke()`, which only calls `notifyLocked`). A `wait` that is armed only because of `wantAdmin` blocks on that channel; without the poke it would never re-evaluate, would stay armed for nothing, and the Stop hook would see it as armed. *(Critic R2-W1.)*
+- The keeper hook is invoked from `Drop`, which holds `Session.reg`, and the keeper calls `Ensure`, which takes `reg`. The hook therefore only starts (or signals) the keeper goroutine and returns; it never calls `Ensure` itself. *(Critic R2-N1.)*
+- A notice the keeper sets is appended to any pending one (for example the account-removed notice from `DropAfter401`), never written over it. *(Critic R2-N2.)*
 
 Without this, an unattended Hermes hostmaster would silently stop waking after a network outage. The one-time drop notice says that channels were lost and that the subscription was restored or not.
 
@@ -153,7 +158,7 @@ Without this, an unattended Hermes hostmaster would silently stop waking after a
 - `client.Probe(url)` performs a handshake that only captures the fingerprint. It is for the human pin flow only.
 
 **M14 — Client-side broker file.** Location: `$AGENT_BUS_CONFIG_DIR`, else `$XDG_CONFIG_HOME/agent-bus`, else `~/.config/agent-bus`, then `brokers/<host>_<port>.json`. Directory 0700, file 0600, written atomically. Fields:
-- normalised `url` (`https://host:port`, port 7700 by default, `http://` refused);
+- normalised `url` (`https://host:port`, port 7700 by default, `http://` refused, host lowercased so `Broker-Host` and `broker-host` share one file and one pin; *Critic R2-N6*);
 - `fingerprint` (the pin);
 - optional `account`, `credential` and `hostmaster`.
 
@@ -171,7 +176,9 @@ Copying this one file to another host carries both the trust decision and the ac
 - The shim always starts its MCP server, so tools can explain problems.
 - If the broker file is missing, unpinned or lacks a credential, every tool returns a fixed message naming the human command to run, plus "do not run it yourself".
 - A pin mismatch returns a fixed message with both fingerprints and the same instruction.
+- The broker file is read once at shim start, and the pin and credential are fixed in the client. So the setup and pin-mismatch messages tell the human to run the named command **and then restart this Claude Code / Hermes session**; otherwise the agent would keep getting the same message after the human fixed the file. *(Critic R2-W4.)*
 - Account errors from `Ensure` (pending, rejected, expired, removed) are rendered as human-directed messages.
+- `Ensure` also maps a 401 from `POST /v1/sessions` to an `AccountError` ("the broker does not recognise this account's credential; the human should run `agent-bus status` and register again if needed"). A credential 401 must never look like a session 401: otherwise the agent sees "session unknown to the broker (expired or reaped)" for a pruned account, and callers that test `errors.Is(err, client.ErrUnauthorized)` would treat it as a dropped session. *(Critic R2-W3.)*
 - After a 401 in the sync loop, the mirror asks `GET /v1/account`. If the account is no longer active, the drop notice says the account was removed (or is no longer active) instead of the "expired while disconnected" text.
 - Every place that drops the session on a 401 (the mirror loop, `send`, `leave`, and `withSession` in `tools.go`) goes through one helper, `Session.DropAfter401(ctx, token)`, which does the account check and then `Drop` or `DropWithNotice`. Revocation wakes the mirror's long-poll, but a `send` can still hit the 401 first; without the shared helper that path would set the misleading "expired while disconnected" notice. *(Critic R1-W1.)*
 
@@ -317,15 +324,15 @@ CREATE INDEX sessions_account ON sessions(account_id)
 | `internal/protocol/protocol_test.go` | Cover `ValidName` and the new waking kinds |
 | `internal/broker/store.go` | Migration 2; claim state on `Store`; `CreateSession(ctx, accountID)`; `removeMember`/`deleteSession` take a reason; `Sync` returns `from_account` and `admin_subscribed`; `channelList` returns `peer_account` and the `removed` state |
 | `internal/broker/channels.go` | Copy account names into `members`/`held`/`inbox`; `ErrPeerRemoved` on send; account in known peers; join returns `peer_account` |
-| `internal/broker/sweeper.go` | Expire pending registrations, prune retired rows; reaping passes reason `left` |
+| `internal/broker/sweeper.go` | Expire pending registrations, prune retired rows; reaping passes reason `left`; disconnect/reconnect events carry the peer's account |
 | `internal/broker/server.go` | Routes; `createSession` authenticates the credential; `Config.KeyPath`/`ControlPath`; `Run` loads the identity, issues and logs the claim code, logs the fingerprint, starts the control socket, serves TLS |
 | `internal/broker/store_test.go`, `channels_test.go`, `sweeper_test.go`, `server_test.go` | Adapt to account-owned sessions; new cases |
 | `internal/client/client.go` | `New(Config) (*Client, error)` with URL, pin and credential; https only; `CreateSession` sends the credential |
 | `internal/client/client_test.go` | TLS test server with a pin |
 | `internal/shim/text.go` | `account` attribute; bodies for `peer_removed` and `registration_pending`; preamble mentions registrants; `ValidateName` uses `protocol.ValidName` |
 | `internal/shim/session.go` | Account-error rendering; `DropWithNotice`; `DropAfter401` (the single 401 drop path); `wantAdmin`/`WantAdmin()`; admin subscription keeper hook |
-| `internal/shim/mirror.go` | `AdminSubscribed` in `Snapshot`/`Summary`; account check after a 401 |
-| `internal/shim/wake.go` | A subscribed session never gets `no_channels`; `StatusReply.Subscribed` |
+| `internal/shim/mirror.go` | `AdminSubscribed` in `Snapshot`/`Summary`; account check after a 401; `Poke()` wakes waiters when `wantAdmin` is cleared |
+| `internal/shim/wake.go` | A subscribed session never gets `no_channels`; `StatusReply.Subscribed`; `noChannelsReason` mentions a removed peer account |
 | `internal/shim/tools.go` | Setup and pin errors; account in the join result and known peers; registers admin tools when the hint is set |
 | `internal/shim/*_test.go` (`text`, `session`, `mirror`, `wake`, `wake_fixed`, `tools`) | Adapt to the TLS client; new cases |
 | `internal/hook/hook.go`, `hook_test.go` | Treat `subscribed` like live channels for the unarmed-wake reminder |
@@ -373,7 +380,7 @@ Steps are safe to run in parallel only when they touch different files and do no
   - 9–17 (broker code; internally sequential);
   - 47–48 (hook).
 - **Safe in parallel after 4–8:** broker code (9–17) and client code (26–28) touch disjoint packages. The client tests (29–31) wait for step 17 because they run the real broker handler.
-- **Within the shim:** 34 (`text.go`) and 37 (`wake.go`) are independent. Steps 35, 36, 38 and 39 form a chain (`session` → `mirror` → `tools` → `admin`).
+- **Within the shim:** 34 (`text.go`) is independent of the rest. Steps 35, 36, 37, 38 and 39 form a chain (`session` → `mirror` → `wake` → `tools` → `admin`): step 37 reads `Session.WantAdmin()` (35) and `Summary.AdminSubscribed` (36), so it cannot run beside them. *(Critic R2-W5.)*
 - **Docs:** 51, 52, 53 and 54 are four independent files.
 
 File locks that must not be parallelised:
