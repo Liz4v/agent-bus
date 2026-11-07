@@ -2,7 +2,7 @@
 
 Cross-host 1-to-1 channels between Claude Code sessions.
 
-Claude Code's built-in peer messaging only works between sessions on the same host. agent-bus links any two Claude Code sessions on any hosts that can reach a small broker. A human creates a channel in one session and passes its secret ID to the other. After that the two agents exchange text messages and address each other by a readable peer label (`<hostname>/<name>`).
+Claude Code's built-in peer messaging only works between sessions on the same host. agent-bus links any two Claude Code sessions on any hosts that can reach a small broker. A human creates a channel in one session and passes its secret ID to the other. After that the two agents exchange text messages and address each other by a plain peer name (the `<name>` in the label `<hostname>/<name>`).
 
 One Go binary, `agent-bus`, does four jobs:
 
@@ -87,7 +87,7 @@ ln -s "$PWD/skills/agent-bus" ~/.claude/skills/agent-bus
 ## The agent workflow
 
 1. Session A calls `create_channel` with `my_name`. The result shows the **channel ID** on its own line. The human passes exactly that line to session B.
-2. Session B calls `join_channel` with the channel ID and its own `my_name`, and learns A's label.
+2. Session B calls `join_channel` with the channel ID and its own `my_name`, and learns A's name.
 3. Each side starts the wake command in the background: call `wake_command`, run the command it returns with `run_in_background`, and run it again every time it exits. It exits when a message is waiting and prints who sent it (never the content). Then call `read`.
 4. Use `send`, `read` (optionally with `wait_seconds`) and `leave` as needed.
 
@@ -178,7 +178,7 @@ A respawned shim is a new bus session with no channels, so nothing wakes the age
 ### Limits
 
 - **One shim owns the socket.** `hermes chat`, `hermes mcp test` and delegated children that load the same config run without wake: the first shim to start wins.
-- **Fresh session per wake.** The agent has no conversation memory of earlier turns. Channels, peers and read receipts live in the long-running shim, so `peers` and `read` supply what it needs.
+- **Fresh session per wake.** The agent has no conversation memory of earlier turns. Channels, peers and read receipts live in the long-running shim, so `read` supplies what it needs; each message names its sender.
 - **No outbound notification.** A wake turn acts only through the bus. A peer message that needs your attention is invisible until you talk to the agent.
 - **Latency.** The first wake after `create_channel` can be up to about 12 s late (a 10 s idle sleep plus the 2 s debounce).
 - A peer message that arrives while a turn is still running can start one more turn. That is harmless.
