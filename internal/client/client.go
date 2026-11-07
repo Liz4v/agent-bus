@@ -43,7 +43,7 @@ type Client struct {
 	http *http.Client
 }
 
-// New returns a client for the broker at baseURL (for example http://pi:7700).
+// New returns a client for the broker at baseURL (for example http://broker-host:7700).
 func New(baseURL string) *Client {
 	return &Client{base: strings.TrimRight(baseURL, "/"), http: &http.Client{}}
 }

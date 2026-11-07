@@ -29,7 +29,7 @@ var version = "dev"
 const usage = `usage: agent-bus <command> [flags]
 
 commands:
-  broker      run the broker (on the Pi):   --listen :7700 --db /var/lib/agent-bus/agent-bus.db
+  broker      run the broker:               --listen :7700 --db /var/lib/agent-bus/agent-bus.db
   shim        run the MCP shim (stdio):     --broker http://host:7700  (or AGENT_BUS_URL)
   wait        block until messages wait:    --socket <path from the wake_command tool>
   hermes-wake wake a Hermes gateway:        --socket <path> --url <webhook> --secret-file <file>
@@ -97,7 +97,7 @@ func runShim(ctx context.Context, args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("shim", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	wakeSocket := fs.String("wake-socket", os.Getenv("AGENT_BUS_WAKE_SOCKET"), "fixed wake socket path (or AGENT_BUS_WAKE_SOCKET); for the Hermes sidecar")
-	brokerURL := fs.String("broker", os.Getenv("AGENT_BUS_URL"), "broker URL, for example http://pi:7700 (or set AGENT_BUS_URL)")
+	brokerURL := fs.String("broker", os.Getenv("AGENT_BUS_URL"), "broker URL, for example http://broker-host:7700 (or set AGENT_BUS_URL)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
