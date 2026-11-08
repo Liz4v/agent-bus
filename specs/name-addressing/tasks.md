@@ -136,11 +136,12 @@
   - `Snapshot.Name`, `Summary.Named` (`Name != ""`), `DropReport.Name`;
   - `applyLocked` stores `resp.Name`;
   - `resetLocked` clears it;
-  - add `DiscardPeerRows()`: under the lock, drop every row whose kind is not `registration_pending`, keep `cursor` and `after`, and call `notifyLocked` (N4, Critic R1 B1);
+  - add `DiscardPeerRows()`: under the lock, drop every row whose kind is not `registration_pending`, keep `cursor` and `after`, advance a discard epoch, kick the loop and call `notifyLocked` (N4, Critic R1 B1);
+  - `loop` records the discard epoch with each request; if the epoch changed by the time the response arrives, it drops the response like an interrupted one (nothing applied, waiters kept, retry at once with the same `after`) (N4, Critic R2 W1);
   - `drop` reports `HadState` as `Name != "" || len(rows) > 0`;
   - delete the channel fields and the `LiveChannels` counting.
-- [ ] Step 20: Modify `internal/shim/mirror_test.go`: replace the channel-state fixtures with `name` in the sync responses; assert `Summary.Named` and `DropReport.Name`; `DiscardPeerRows` drops `text`/`peer_*` rows, keeps `registration_pending`, leaves the cursor alone, and a later sync does not bring the dropped rows back.
-- [ ] Step 21: Modify `internal/shim/session.go` and `internal/shim/session_test.go` (N15): `accountGoneNotice` and `dropNotice` wording (the name is released; claim it again with `claim_name`; partners were told); the credential-unrecognised notice in `session.go` ("…so your channels are gone…", currently line 195) → "your name was released"; the `DropReport.HadState` comment ("held a name or unread rows"); the tests assert the new texts, including the name.
+- [ ] Step 20: Modify `internal/shim/mirror_test.go`: replace the channel-state fixtures with `name` in the sync responses; assert `Summary.Named` and `DropReport.Name`; `DiscardPeerRows` drops `text`/`peer_*` rows, keeps `registration_pending`, leaves the cursor alone, and a later sync does not bring the dropped rows back; a sync response in flight during `DiscardPeerRows` (use the test broker's `delay` hook to hold it) applies neither its rows nor its stale `name`.
+- [ ] Step 21: Modify `internal/shim/session.go` and `internal/shim/session_test.go` (N15): `accountGoneNotice` and `dropNotice` wording (the name is released; claim it again with `claim_name`; partners were told); the credential-unrecognised notice in `session.go` ("…so your channels are gone…", currently line 195) → "your name was released"; the `DropReport.HadState` comment ("held a name or unread rows"); the tests assert the new texts, including the name. In the shared `testBroker` harness in `session_test.go`, rename `failChannels` to `failName` and point it at `/v1/name`; rewrite the `CreateChannel`/`JoinChannel` fixtures (`TestCloseMakesPeerReadPeerLeftImmediately`, `TestDropWithNoticeAppends` and the others) to claim and send, so a partnership exists where a `peer_left` is expected, and assert `r.Name` instead of `r.Channels[0].State` (Critic R2 W3).
 - [ ] Step 22: Modify `internal/shim/wake.go` (N15):
   - `status()` sets `Named`;
   - `handleWait` waits while `sum.Named || w.subscribed(sum)` and otherwise replies `WaitNoName`;
@@ -161,7 +162,7 @@
     - `read`/`wake_command`: wording kept;
   - arg structs `claimArgs{Name}` and `sendArgs{Peer, Text}` (peer = "the other session's name, e.g. bob"); delete `createArgs`, `joinArgs` and `leaveArgs`;
   - `noChannels` → `noName`;
-  - `brokerErr`: delete the `KnownPeers` and "You have no channels" branches; add the N12 mapping (`http_404`/`http_405` → "broker must be upgraded" text);
+  - `brokerErr`: delete the `KnownPeers` and "You have no channels" branches; add the N12 mapping (`http_404`/`http_405` → "broker must be upgraded" text); render code `no_name` as the `noName` text (N13, Critic R2 N1);
   - `withSession` comment "(claim only)";
   - `release_name`: after a successful `DELETE /v1/name`, call `t.m.DiscardPeerRows()` before `Refresh` (N4); a 401 drops the session like `send` does;
   - the `Tools` doc comment ("six MCP tools" → five).
@@ -172,7 +173,8 @@
   - `claim_name` registers lazily and its result text names the session;
   - claim refusals render the broker messages;
   - send before claim → "claim_name first" with no broker call;
-  - send errors (`unknown_peer`, `peer_left`, `peer_removed`, `self_send`) render;
+  - send errors (`unknown_peer`, `peer_left`, `peer_removed`, `self_send`) render; a send after `release_name` (token kept, no name) gets the `noName` text, without the old-shim upgrade tail;
+  - `TestCreateFailureAfterRegistrationReusesSession` becomes the claim equivalent, using the harness's `failName` (Step 21);
   - `release_name` with and without a name; after a release, `read` shows no earlier peer rows (they were in the mirror before the release) and a connected `WAIT` answers `no_name`;
   - an old-broker 404 on `claim_name` → the upgrade text;
   - read renders `from`/`account`/first-contact;
@@ -181,7 +183,7 @@
 - [ ] Step 27: Modify `internal/shim/admin_test.go`: fixtures and expected texts for Step 26; a subscribed session with no name is still woken by `registration_pending`.
 - [ ] Step 28: Modify `cmd/agent-bus/main.go`: the `shim.NewTools` call without `os.Hostname`; any help or usage text that mentions channels or channel IDs.
 
-  **Checkpoint B** (needs Checkpoint A; `session_test.go` imports the broker): `go build ./...`, `go vet ./internal/client ./internal/shim ./cmd/...` and `go test -race ./internal/client ./internal/shim` are green. A repo-wide `go vet ./...` waits for Checkpoint C and Step 35 (the e2e and wake-consumer tests still use removed symbols).
+  **Checkpoint B** (needs Checkpoint A; `session_test.go` imports the broker): `go build ./internal/client ./internal/shim`, `go vet ./internal/client ./internal/shim` and `go test -race ./internal/client ./internal/shim` are green. `cmd/agent-bus` imports `wait`, `hook` and `hermeswake`, so it cannot build until Steps 29–34 (Critic R2 W2). A repo-wide `go vet ./...` waits for Step 35 (the e2e tests still use removed symbols).
 
 ### Layer: Wake consumers
 - [ ] Step 29: Modify `internal/wait/wait.go` (N15, N16): `ExitNoChannels` → `ExitNothing` (value 1); `WaitNoName`; `FilterLabels` → `FilterNames`, using `protocol.ValidName` plus the system sender; the "shim went away" texts are unchanged.
@@ -191,7 +193,7 @@
 - [ ] Step 33: Modify `internal/hermeswake/run.go` and `internal/hermeswake/post.go` (N16): `NoChannelsSleep` → `NoNameSleep` and `DefaultNoChannelsSleep` → `DefaultNoNameSleep` (default unchanged, 10 s); `WaitNoName`; log text; the label filter in `post.go` uses `ValidName` (via `wait.FilterNames` if it already shares it).
 - [ ] Step 34: Modify `internal/hermeswake/run_test.go`, `internal/hermeswake/sock_test.go` and `internal/hermeswake/post_test.go`: the renamed config field and status; `no_name` → sleeps `NoNameSleep`; the filter.
 
-  **Checkpoint C:** `go test -race ./internal/wait ./internal/hook ./internal/hermeswake` is green.
+  **Checkpoint C:** `go build ./...` and `go vet ./cmd/... ./internal/wait ./internal/hook ./internal/hermeswake` are clean, and `go test -race ./internal/wait ./internal/hook ./internal/hermeswake` is green.
 
 ### Layer: End to end
 - [ ] Step 35: Rewrite the channel scenarios in `internal/e2e/e2e_test.go`:
@@ -200,7 +202,7 @@
   - **`TestAccountsUnauthenticatedPendingAndPinned`:** use `claim_name` in place of `create_channel`.
   - **`TestTwoUsersSeeEachOthersAccount…`:** claim and send.
   - **`TestHostmasterRemovesAUserMidChannel`:** rename it to `…MidConversation`; the partner gets `peer_removed` and the send error.
-  - **Others:** fixture updates; drop `uuidRE`.
+  - **Others:** fixture updates; drop `uuidRE`. Names are now broker-wide, so two live sessions on one test broker cannot both claim the same name (`TestHermesWakeEndToEnd` uses `alice` for both `a` and `a2`): give each its own name, or release first (Critic R2 N3).
 
   Done: `go test -race ./internal/e2e`.
 
@@ -229,7 +231,8 @@
   - the event list (no `peer_joined`/`channel_expired`);
   - the Addressing paragraph;
   - the Hermes section: the webhook `--prompt` ("a new channel ID" → "tell the user"), the "labelled `<hostname>/<my_name>`" note, the `idle_timeout_seconds` note ("ends the session and all its channels" → "releases its name"), the respawn paragraph and the memory/system-prompt block (claim a name again after a gateway restart; no channel IDs), the "Fresh session per wake" note, and the "Latency" note ("after `create_channel`" → "after `claim_name`");
-  - the admin paragraph ("even with no channels" → "even with no name");
+  - the admin paragraph ("even with no channels" → "even with no name"; "its peers get `peer_removed`" → "its conversation partners get `peer_removed`");
+  - the Hermes section intro ("carries the sender labels" → "sender names") and the Stop hook paragraph's "only a count and the sender labels" (Critic R2 N2);
   - Security model: the Accounts bullet's "no usable credentials, sessions or joinable channels" → drop "joinable channels"; replace "Channels" with "Names" (not secrets; any approved account can message any held name; first-come squatting; the probe surface of `name_taken`/`unknown_peer`; first-contact marker), rewrite "Account visibility", add the unbounded-inbox note, and remove "Labels are self-reported" from Unchanged;
   - the upgrade note (clean break; upgrade broker and shims together; copy `agent-bus.db` before upgrading, because rolling back means restoring that copy, per N11). Update the earlier multi-user upgrade list ("drops all channels, sessions and messages") so it does not contradict the new note.
 - [ ] Step 39: Modify `CLAUDE.md`: the architecture summary (the opening paragraph: no channel or secret ID; routes `/v1/name`; "Stores only SHA-256 hashes of channel IDs, …" → drop channel IDs; "five tools"; the `names.go`, partners and departed description; the sweeper without channel TTL; `wait` "prints only sender names"; `internal/protocol` "label pattern" → "name rules"); "Behaviours that span several files" (addressing by bare broker-wide name; the waking list); the doc-sync paragraph ("channel expiry" in the list of restated behaviour) and checklist bullets (tool list and `claim_name`'s `name` rules instead of `my_name`; `wait` exits on a pending message or no name; the timings list without the channel TTL).
@@ -238,6 +241,6 @@
 ### Layer: Verification
 - [ ] Step 41: Final verification:
   - `just test` and `just build` are green; `go vet ./...` is clean; `gofmt -l .` is empty;
-  - `grep -rniE 'channel|handle|ch-|uuid|host/name|ValidLabel|peer_joined|LiveChannels' --include=*.go --include=*.md --include=*.nix --include=*.service . | grep -v '^./specs/'` shows only intended hits (Go `chan` and context words, `notify.go` waiter channels). Review each remaining hit;
+  - `grep -rniE 'channel|handle|ch-|uuid|host/name|label|my_name|ValidLabel|peer_joined|LiveChannels' --include=*.go --include=*.md --include=*.nix --include=*.service . | grep -v '^./specs/'` shows only intended hits (Go `chan` and context words, `notify.go` waiter channels, and internal identifiers such as `UnreadLabels` if kept). Review each remaining hit; no user-facing text may still say "label" for a peer address;
   - re-read both `SKILL.md` files against `tools.go`, `wake.go`, `wait.go` and `protocol.go` (CLAUDE.md checklist);
   - no hostnames or personal paths in the diff.

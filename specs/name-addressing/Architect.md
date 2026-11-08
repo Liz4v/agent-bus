@@ -44,6 +44,7 @@ The design deletes more than it adds. `channels.go` (handles, join ordering, hel
 - `deleteSession` calls `depart` first, then deletes the session row. That cascades its inbox, its `departed` rows and any partners left over.
 - `ReleaseName` calls `depart(peer_left)`, sets `name` and `name_key` to NULL, and deletes the session's own inbox rows except `registration_pending` rows (N10). It then bumps the session.
 - The shim must discard the same rows from its local mirror. The mirror keeps every synced row above the read cursor, and later syncs ask only for rows above `after`, so a broker-side delete never reaches rows the shim already holds. After a successful `DELETE /v1/name`, `release_name` calls `Mirror.DiscardPeerRows()`, which drops every local row whose kind is not `registration_pending` (cursor and `after` unchanged) and notifies waiters. Without it, `read` would still show the discarded messages and a `wait` would answer `pending` instead of `no_name`. *(Critic R1 B1.)*
+- A sync response already in flight when `DiscardPeerRows` runs can carry rows the broker has since deleted (a message that arrived just before the release) and the old name. `DiscardPeerRows` therefore also advances a discard epoch and kicks the loop. The loop records the epoch when it sends a sync request and drops a response whose request predates the latest discard, the same way it drops an interrupted response: no rows applied, waiters kept, immediate retry with the same `after`. *(Critic R2 W1.)*
 - A session with no name has no partners: a send needs a name, and release or depart clears them. So `depart` on an unnamed session does nothing.
 
 **N5 — `departed` gives precise send errors without leaking names.**
@@ -118,6 +119,7 @@ The design deletes more than it adds. `channels.go` (handles, join ordering, hel
 - The `hostname` dependency is dropped from `NewTools` and `BuildLabel` is deleted.
 - The `noChannels` text becomes a `noName` text.
 - `brokerErr` loses the `KnownPeers` rendering.
+- `brokerErr` renders the code `no_name` as the shim's own `noName` text, not the broker message, whose upgrade tail is meant for old shims only. A new shim reaches it with a token but no name (after `release_name`, or in a session registered only by `admin_subscribe`). *(Critic R2 N1.)*
 
 **N14 — Rendering.**
 - `<peer-message from="bob" account="liz" kind="text" at="…">`. There is no `handle` attribute.
@@ -211,8 +213,8 @@ inbox(id PK AUTOINCREMENT, session_id → sessions CASCADE, from_name NULL, from
 | `internal/broker/store_test.go`, `sweeper_test.go`, `server_test.go`, `accounts_test.go`, `notify_test.go` | Rewrite the channel fixtures to claim and send; add the cases listed in tasks. |
 | `internal/client/client.go` (+ test) | `ClaimName`, `ReleaseName`; delete `CreateChannel`, `JoinChannel`, `Leave`; `APIError` loses `KnownPeers`. |
 | `internal/shim/text.go` (+ test) | Delete `BuildLabel`. `ValidateName` takes the argument name and reports reserved names. `FrameRow` per N14; event bodies. |
-| `internal/shim/mirror.go` (+ test) | `Name` / `Named` instead of channels; `DropReport.Name`; `DiscardPeerRows()` for release (N4). |
-| `internal/shim/session.go` (+ test) | Notice wording (N15). |
+| `internal/shim/mirror.go` (+ test) | `Name` / `Named` instead of channels; `DropReport.Name`; `DiscardPeerRows()` and the discard epoch for release (N4). |
+| `internal/shim/session.go` (+ test) | Notice wording (N15). `session_test.go` also holds the shared `testBroker` harness: its `failChannels` hook on `/v1/channels` and its channel fixtures move to `/v1/name` and claim/send. |
 | `internal/shim/wake.go` (+ tests `wake_test.go`, `wake_fixed_test.go`) | `Named`, `WaitNoName`, reason text. |
 | `internal/shim/tools.go` (+ test) | Tool set per N13; `NewTools` signature; `brokerErr`; upgrade mapping (N12). |
 | `internal/shim/admin.go` (+ test) | Description and result texts: "even without a name" instead of "no channels"; keeper comment. |
@@ -235,6 +237,7 @@ inbox(id PK AUTOINCREMENT, session_id → sessions CASCADE, from_name NULL, from
 - Client (15–16) depends on protocol only, but its tests need the server (9).
 - Shim text (17–18) and mirror (19–20) come before session (21) and wake (22–23). Those come before tools (24–25), then admin (26–27), then `main.go` (28).
 - `wait`, hook and Hermes (29–34) depend on protocol only.
+- `cmd/agent-bus` imports `internal/wait`, `internal/hook` and `internal/hermeswake`, so it compiles only after the wake-consumer steps (29–34). Checkpoint B builds `./internal/client ./internal/shim` only; `./cmd/...` and `go build ./...` move to Checkpoint C. *(Critic R2 W2.)*
 - Shim *tests* depend on the broker track: `internal/shim/session_test.go` imports `internal/broker`, so Checkpoint B's `go test ./internal/shim` needs Checkpoint A first. *(Critic R1 W7.)*
 - Inside a package, Go compiles all test files together (and `go vet` type-checks them), so a per-step `go test`/`go vet` cannot pass while a sibling test file still uses deleted symbols. The broker test steps (10–14) are verified together at Checkpoint A, and the shim test steps at Checkpoint B. *(Critic R1 W2.)*
 - E2E (35) depends on everything above.

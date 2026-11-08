@@ -2,6 +2,46 @@
 
 > Phase 3 — Plan stress-test, in rounds. Newest round first.
 
+## Round 2 — 2026-11-07
+
+**Summary:** The Round 1 fixes hold: `DiscardPeerRows` closes the stale-mirror hole for rows already on the host, the e2e expectation now matches N3/N4, the per-step Done lines no longer claim builds that cannot pass inside the broker track, and `send`'s partner insert comes before the `enqueue`. This round re-read every cited symbol against the code (`store.go`, `channels.go`, `sweeper.go`, `accounts.go` `deleteAccount`/`notifyAdmins`, `server.go` `sync`, `mirror.go` loop and `applyLocked`, `tools.go`, `wake.go`, `session.go`, `client.go` `do`, `wait.go`, `hook.go`, `hermeswake`, `cmd/agent-bus/main.go`) and found no blockers. Three warnings: (W1) a narrower form of R1 B1 remains. A sync response computed before the release and applied after `DiscardPeerRows` brings back a just-deleted message and the old name. (W2) Checkpoint B still cannot pass, because `cmd/agent-bus` imports the wake-consumer packages that are only rewritten in Steps 29–34. (W3) The shared `testBroker` harness in `session_test.go` (`failChannels` on `/v1/channels`, `CreateChannel`/`JoinChannel` fixtures) was not assigned to any step. Lenses: Security: none found. `name_taken`/`unknown_peer` are the only probes, `departed` answers only former partners, the account comes from the session join, and `agent-bus`/`admin` are reserved case-insensitively. Data integrity: none found. FKs, cascades, the `departed(name_key)` and `partners(hi)` indexes and the v2→v3 drop order are sound, and `first_contact` scans into a Go bool through database/sql's string conversion. Scope: no creep. Upgrade paths: old shim → 410 text and new shim → `http_404` mapping both match `client.do`'s plain-text handling. No `copilot-instructions.md`, `specs/STATE.md` or `docs/` exist in this repo.
+
+### Carried over from Round 1
+None. Round 1 left no decisions open.
+
+### Blockers (applied)
+None.
+
+### Warnings
+| ID | Lens | Finding | Where fixed / why skipped |
+|----|------|---------|---------------------------|
+| W1 | Correctness (race) | `server.sync` recomputes after a version bump, so a message arriving just before `release_name` can sit in a response that is already on the wire. If the loop applies it after `DiscardPeerRows`, `read` shows a discarded message and the mirror briefly says `Named` again. Its ID is above `after`, so the follow-up `Refresh` doesn't remove it. This breaks the Analyst's "discard that session's unread messages" in a narrow window. | Architect N4 (new bullet), Files to Modify (mirror); tasks Step 19 (discard epoch, loop drops pre-discard responses), Step 20 (test using the harness's `delay` hook). |
+| W2 | Verification (build) | Checkpoint B ran `go build ./...` and `go vet ./cmd/...` after Step 28. `cmd/agent-bus/main.go` imports `internal/wait`, `internal/hook` and `internal/hermeswake`, which still reference `WaitNoChannels`, `LiveChannels` and `ValidLabel` until Steps 29–34, so it would fail when run in step order. | tasks Checkpoint B (shim and client only), Checkpoint C (`go build ./...` and vet of `./cmd/...`); Architect *Dependencies*. |
+| W3 | Test-fixture compatibility | `internal/shim/session_test.go` holds the `testBroker` harness that every shim test uses. Its `failChannels` hook targets `/v1/channels` (which becomes the 410 route), `TestCloseMakesPeerReadPeerLeftImmediately` and `TestDropWithNoticeAppends` call `CreateChannel`/`JoinChannel`, and one test asserts `r.Channels[0].State`. Step 21 covered only notice wording, and `tools_test.go`'s `TestCreateFailureAfterRegistrationReusesSession` depends on `failChannels`. | tasks Step 21 (harness and fixtures), Step 25 (claim equivalent of the retry test); Architect Files to Modify (session row). |
+
+### Notes
+| ID | Lens | Finding | Where fixed / why skipped |
+|----|------|---------|---------------------------|
+| N1 | UX | A new shim can still hold a token without a name (after `release_name`, or a session registered only by `admin_subscribe`), so `send` reaches the broker's `no_name`, whose text ends with an upgrade tail meant for old shims. The agent would be told its agent-bus may be outdated. | Architect N13 (`brokerErr` maps `no_name` to `noName`); tasks Step 24, Step 25 test. |
+| N2 | Docs naming the module | Step 41's grep did not search for `label` or `my_name`, so README's Hermes intro ("carries the sender labels") and the hook paragraph's "sender labels" could survive. The admin paragraph's "its peers get `peer_removed`" should say partners. | tasks Step 38 (both paragraphs), Step 41 (grep adds `label|my_name`). |
+| N3 | Testing | `TestHermesWakeEndToEnd` claims `alice` from two live sessions (`a`, `a2`) on one broker. With broker-wide names, the second claim gets `name_taken`. | tasks Step 35 (Others). |
+| N4 | Correctness | Release keeps the token, so a released session's `read` still syncs. That's fine because no peer can address it, and `registration_pending` is the only kind that can still arrive. | No change needed. |
+
+### Decisions (for the user)
+None.
+
+### Overrides earlier rounds
+- none. Round 1 B1 is extended by W1, not undone.
+
+### Residual risks (couldn't be verified offline)
+- W1's epoch check relies on the loop holding `m.mu` both when it reads the epoch for a request and when it applies the response. Step 20's delayed-sync test must actually interleave the release between the two.
+- Round 1's residual risks stand: concurrent `ClaimName` overlap, `schemaV3` drop order with populated `members`, and mixed-version Hermes/hook against an old shim.
+
+### Verdict
+Approved
+
+---
+
 ## Round 1 — 2026-11-07
 
 **Summary:** The design is sound and fits the store's existing pattern: one IMMEDIATE transaction per mutation with a bump set, inbox rows as events, and the mirror/wake split. The `departed` table is a good fit for the Analyst's "precise error without a listing" rule. Partner-only `peer_removed` errors are the right reading of the Analyst, because a removal error for a non-partner would reveal that a name existed. The main defect is in the shim. Release deletes unread rows only on the broker, but the shim's mirror already holds every synced unread row and never re-fetches below `after`. So after `release_name`, `read` would still show the discarded messages and `wait` would answer `pending` instead of `no_name` (B1). The e2e step also encoded an expectation that contradicts N3/N4 (B2). Several per-step "Done" checks could not pass because Go compiles and vets all of a package's test files together. The doc steps missed about a dozen channel mentions (README Hermes section, flake.nix, skill frontmatter, CLAUDE.md lines). Lenses: Security: no new hole found; the probe surface is as the Analyst accepted, the account on every row comes from the session join, and reserving `agent-bus` stops a peer from spoofing the system sender. Data integrity: FKs and cascades are complete, the migration order is FK-safe under `foreign_keys(1)`, and rollback was undocumented (W5). Scope: no creep. There are no `copilot-instructions.md`, `specs/STATE.md`, `docs/business-rules` or `docs/UX-Documents` in this repo.
