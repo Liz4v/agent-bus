@@ -1,0 +1,11 @@
+{
+  "feature": "name-addressing",
+  "status": "ready",
+  "current_step": 0,
+  "total_steps": 41,
+  "completed_steps": [],
+  "errors": [],
+  "notes": [
+    "Critic round 1 (2026-11-07): 2B/7W/3N applied, 0 decisions open, verdict Blockers fixed, verify next round."
+  ]
+}
