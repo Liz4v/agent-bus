@@ -26,7 +26,7 @@ const EventType = "agent_bus_wake"
 
 const postTimeout = 10 * time.Second
 
-// payload is the whole body: a count and sender labels, never content.
+// payload is the whole body: a count and sender names, never content.
 type payload struct {
 	EventType string   `json:"event_type"`
 	Count     int      `json:"count"`
@@ -58,7 +58,7 @@ type Poster struct {
 // Post sends one notification. Only HTTP 202 is success: Hermes answers 200
 // "ignored"/"duplicate" without starting a turn.
 func (p *Poster) Post(ctx context.Context, count int, from []string) error {
-	body, err := json.Marshal(payload{EventType: EventType, Count: count, From: wait.FilterLabels(from)})
+	body, err := json.Marshal(payload{EventType: EventType, Count: count, From: wait.FilterNames(from)})
 	if err != nil {
 		return err
 	}

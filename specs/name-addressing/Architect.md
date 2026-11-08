@@ -276,3 +276,15 @@ For the critic to scrutinise:
 - [x] No step requires modifying multiple unrelated files
 - [x] Parallelisation opportunities and file locks declared
 - [x] Notification/event needs considered for mutations affecting live state
+
+## Coder deviations
+
+Minor deviations from the plan, recorded by the coder (2026-11-08). None changes a design decision.
+
+- **Compile-order moves.** `DropReport.Name` was added to `internal/shim/session.go` in Step 19 (the mirror needs it), and `internal/hermeswake/post.go` switched to `wait.FilterNames` in Step 29 (the function was renamed there). The remaining wording and tests of those files landed in their own steps.
+- **`ErrPeerLeft` / `ErrPeerRemoved` stay package-level errors** with generic wording ("that peer released its name or its session ended"), not a per-call message that embeds the name. The sender knows which name it addressed, and the shim's `read` event bodies do name the peer.
+- **`release_name` with no token or no name** answers a normal (non-error) "You hold no name.", since the broker call is idempotent. `send` without a token is an error.
+- **`send` does not validate `peer` on the shim side.** The broker's `bad_name` / `unknown_peer` answers are rendered as they are, so the two cannot disagree about reserved names.
+- **Test fixtures renamed where the old name described removed behaviour:** `TestMigrationV1ToV2...` → `...ToCurrent...`, `TestRemoveMember*` → `TestDepart*`, `TestHostmasterRemovesAUserMidChannel` → `...MidConversation`, `TestRestrictBlocksDeletes` → `TestRestrictBlocksAccountDeleteAndSessionDeleteCascades`. A new broker test is `TestConcurrentNameClaimsExactlyOneWins` because `accounts_test.go` already has `TestConcurrentClaimsExactlyOneWins` (hostmaster claim codes).
+- **The in-flight discard test is scripted, not timed.** `TestDiscardPeerRowsDropsAResponseAlreadyInFlight` uses its own server so that the held request is an immediate (wait=0) sync, which a kick cannot cancel. The `delay` hook of the shared test broker would let the kick cancel a long-poll instead, and the test would pass without the epoch check. With the check disabled the scripted test fails, as intended.
+- **e2e fixtures** call their per-peer label a `tag` (it is only an account-name suffix and a failure-message prefix now; shims no longer know a hostname).

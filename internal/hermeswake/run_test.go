@@ -125,11 +125,11 @@ func (h *harness) count(prefix string) int {
 var (
 	pending = protocol.WaitReply{Status: protocol.WaitPending}
 	rearm   = protocol.WaitReply{Status: protocol.WaitRearm}
-	noChan  = protocol.WaitReply{Status: protocol.WaitNoChannels}
+	noName  = protocol.WaitReply{Status: protocol.WaitNoName}
 )
 
 func st(count int, cursor int64) protocol.StatusReply {
-	return protocol.StatusReply{Count: count, From: []string{"h/a"}, Cursor: cursor}
+	return protocol.StatusReply{Count: count, From: []string{"alice"}, Cursor: cursor}
 }
 
 func TestOnePostPerWakeAndNoneWhileUnreadUnchanged(t *testing.T) {
@@ -249,8 +249,8 @@ func TestBackoffGrowsCapsAndResets(t *testing.T) {
 	}
 }
 
-func TestNoChannelsSleepsAndRearmRewaits(t *testing.T) {
-	h := &harness{waits: []any{noChan, rearm, rearm}}
+func TestNoNameSleepsAndRearmRewaits(t *testing.T) {
+	h := &harness{waits: []any{noName, rearm, rearm}}
 	h.run(t)
 	want := []string{"wait", "sleep:10s", "wait", "wait", "wait"}
 	if !slices.Equal(h.events, want) {
@@ -317,13 +317,13 @@ func TestContextCancelExitsPromptlyInEveryState(t *testing.T) {
 		b   blocker
 		cfg Config
 	}{
-		"idle wait":         {blocker{inWait: true}, Config{}},
-		"fire status":       {blocker{inStatus: true}, Config{}},
-		"fire post":         {blocker{inPost: true}, Config{}},
-		"hold sleep":        {blocker{}, Config{Poll: hour}},
-		"spacing sleep":     {blocker{}, Config{Poll: time.Millisecond, MinSpacing: hour}},
-		"backoff sleep":     {blocker{inWait: false}, Config{}},
-		"no_channels sleep": {blocker{}, Config{NoChannelsSleep: hour}},
+		"idle wait":     {blocker{inWait: true}, Config{}},
+		"fire status":   {blocker{inStatus: true}, Config{}},
+		"fire post":     {blocker{inPost: true}, Config{}},
+		"hold sleep":    {blocker{}, Config{Poll: hour}},
+		"spacing sleep": {blocker{}, Config{Poll: time.Millisecond, MinSpacing: hour}},
+		"backoff sleep": {blocker{inWait: false}, Config{}},
+		"no_name sleep": {blocker{}, Config{NoNameSleep: hour}},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -334,8 +334,8 @@ func TestContextCancelExitsPromptlyInEveryState(t *testing.T) {
 			case "backoff sleep":
 				s = errShim{}
 				cfg.BackoffMin, cfg.BackoffMax = hour, hour
-			case "no_channels sleep":
-				s = noChanShim{}
+			case "no_name sleep":
+				s = noNameShim{}
 			}
 			cfg.Shim, cfg.Notifier = s, n
 			ctx, cancel := context.WithCancel(context.Background())
@@ -365,9 +365,9 @@ func (errShim) Status(context.Context) (protocol.StatusReply, error) {
 	return protocol.StatusReply{}, errors.New("refused")
 }
 
-type noChanShim struct{ errShim }
+type noNameShim struct{ errShim }
 
-func (noChanShim) Wait(context.Context) (protocol.WaitReply, error) { return noChan, nil }
+func (noNameShim) Wait(context.Context) (protocol.WaitReply, error) { return noName, nil }
 
 func TestSocketShimAndRealClock(t *testing.T) {
 	path := fakeShim(t, func(cmd string, c net.Conn) {
@@ -397,7 +397,7 @@ func TestSocketShimAndRealClock(t *testing.T) {
 
 func TestDefaultsAreTheDocumentedValues(t *testing.T) {
 	c := Config{}.withDefaults()
-	got := fmt.Sprint(c.Poll, c.Stuck, c.MinSpacing, c.NoChannelsSleep, c.BackoffMin, c.BackoffMax)
+	got := fmt.Sprint(c.Poll, c.Stuck, c.MinSpacing, c.NoNameSleep, c.BackoffMin, c.BackoffMax)
 	if got != "5s 10m0s 10s 10s 1s 1m0s" {
 		t.Fatalf("defaults: %s", got)
 	}

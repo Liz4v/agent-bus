@@ -6,26 +6,6 @@ import (
 	"testing"
 )
 
-func TestChannelIDFormat(t *testing.T) {
-	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-	for i := 0; i < 100; i++ {
-		if id := NewChannelID(); !re.MatchString(id) {
-			t.Fatalf("bad UUIDv4: %q", id)
-		}
-	}
-}
-
-func TestChannelIDUnique(t *testing.T) {
-	seen := make(map[string]struct{}, 10000)
-	for i := 0; i < 10000; i++ {
-		id := NewChannelID()
-		if _, dup := seen[id]; dup {
-			t.Fatalf("duplicate ID %q", id)
-		}
-		seen[id] = struct{}{}
-	}
-}
-
 func TestTokenFormat(t *testing.T) {
 	re := regexp.MustCompile(`^[0-9a-f]{64}$`)
 	a, b := NewToken(), NewToken()

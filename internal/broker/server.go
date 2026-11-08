@@ -47,11 +47,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/subscribe", s.adminAuth(s.adminSubscribe))
 	mux.HandleFunc("POST /v1/sessions", s.createSession)
 	mux.HandleFunc("DELETE /v1/sessions/self", s.auth(s.deleteSelf))
-	mux.HandleFunc("POST /v1/channels", s.auth(s.createChannel))
-	mux.HandleFunc("POST /v1/channels/join", s.auth(s.joinChannel))
+	mux.HandleFunc("POST /v1/name", s.auth(s.claimName))
+	mux.HandleFunc("DELETE /v1/name", s.auth(s.releaseName))
 	mux.HandleFunc("POST /v1/messages", s.auth(s.send))
-	mux.HandleFunc("POST /v1/leave", s.auth(s.leave))
 	mux.HandleFunc("POST /v1/sync", s.auth(s.sync))
+	// The channel routes of older versions: answered before authentication, so
+	// an old shim reads the upgrade message instead of a bare 401.
+	mux.HandleFunc("POST /v1/channels", s.gone)
+	mux.HandleFunc("POST /v1/channels/join", s.gone)
+	mux.HandleFunc("POST /v1/leave", s.gone)
 	return s.logging(mux)
 }
 
@@ -66,7 +70,7 @@ func (w *statusWriter) WriteHeader(code int) {
 }
 
 // logging logs method, path, status and a short hash of the bearer value. It
-// never logs bodies, tokens, credentials or channel IDs. On the routes
+// never logs bodies, tokens or credentials. On the routes
 // authenticated by the account credential the hash is labelled "cred".
 func (s *Server) logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -130,9 +134,7 @@ func (s *Server) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		s.log.Error("internal error", "path", r.URL.Path, "err", err)
 		be = newErr(http.StatusInternalServerError, protocol.CodeInternal, "internal error")
 	}
-	s.writeJSON(w, be.Status, protocol.ErrorBody{Error: protocol.ErrorDetail{
-		Code: be.Code, Message: be.Message, KnownPeers: be.KnownPeers,
-	}})
+	s.writeJSON(w, be.Status, protocol.ErrorBody{Error: protocol.ErrorDetail{Code: be.Code, Message: be.Message}})
 }
 
 // decode reads a JSON body limited to protocol.MaxBodyBytes.
@@ -180,30 +182,32 @@ func (s *Server) deleteSelf(w http.ResponseWriter, r *http.Request, session int6
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) createChannel(w http.ResponseWriter, r *http.Request, session int64) {
-	var req protocol.CreateChannelRequest
-	if !s.decode(w, r, &req) {
-		return
-	}
-	id, handle, err := s.store.CreateChannel(r.Context(), session, req.Label)
-	if err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	s.writeJSON(w, http.StatusCreated, protocol.CreateChannelResponse{ChannelID: id, Handle: handle})
+// gone answers the removed channel routes with 410 upgrade_required.
+func (s *Server) gone(w http.ResponseWriter, r *http.Request) {
+	s.writeErr(w, r, newErr(http.StatusGone, protocol.CodeUpgradeRequired,
+		"this broker addresses peers by name, not by channel: upgrade agent-bus on this host and restart the session"))
 }
 
-func (s *Server) joinChannel(w http.ResponseWriter, r *http.Request, session int64) {
-	var req protocol.JoinChannelRequest
+func (s *Server) claimName(w http.ResponseWriter, r *http.Request, session int64) {
+	var req protocol.ClaimNameRequest
 	if !s.decode(w, r, &req) {
 		return
 	}
-	handle, peer, peerAccount, err := s.store.JoinChannel(r.Context(), session, req.ChannelID, req.Label)
+	name, err := s.store.ClaimName(r.Context(), session, req.Name)
 	if err != nil {
 		s.writeErr(w, r, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, protocol.JoinChannelResponse{Handle: handle, PeerLabel: peer, PeerAccount: peerAccount})
+	s.writeJSON(w, http.StatusOK, protocol.ClaimNameResponse{Name: name})
+}
+
+func (s *Server) releaseName(w http.ResponseWriter, r *http.Request, session int64) {
+	released, err := s.store.ReleaseName(r.Context(), session)
+	if err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, protocol.ReleaseNameResponse{Released: released})
 }
 
 func (s *Server) send(w http.ResponseWriter, r *http.Request, session int64) {
@@ -216,18 +220,6 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, session int64) {
 		return
 	}
 	s.writeJSON(w, http.StatusAccepted, protocol.SendResponse{})
-}
-
-func (s *Server) leave(w http.ResponseWriter, r *http.Request, session int64) {
-	var req protocol.LeaveRequest
-	if !s.decode(w, r, &req) {
-		return
-	}
-	if err := s.store.Leave(r.Context(), session, req.To); err != nil {
-		s.writeErr(w, r, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // sync is the long-poll: subscribe, transact, then respond or wait.

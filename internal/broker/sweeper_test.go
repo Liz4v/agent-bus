@@ -41,12 +41,28 @@ func (e *sweepEnv) sweep() {
 	}
 }
 
-// pair returns two joined sessions a ("h/a") and b ("h/b") and a's handle for the channel.
-func (e *sweepEnv) pair() (a, b int64, ha string) {
+// pair returns two partnered, named sessions: a ("alice") and b ("bob"). One
+// message went each way and both inboxes were acknowledged, so the tests see
+// only the events that follow.
+func (e *sweepEnv) pair() (a, b int64) {
 	a, b = e.session(), e.session()
-	id, ha := mustCreate(e.t, e.s, a, "h/a")
-	mustJoin(e.t, e.s, b, id, "h/b")
-	return
+	claimAs(e.t, e.s, a, "alice")
+	claimAs(e.t, e.s, b, "bob")
+	mustSend(e.t, e.s, a, "bob", "hello")
+	mustSend(e.t, e.s, b, "alice", "hello back")
+	e.drain(a)
+	e.drain(b)
+	return a, b
+}
+
+// drain acknowledges everything in a session's inbox.
+func (e *sweepEnv) drain(sess int64) {
+	e.t.Helper()
+	r := sync0(e.t, e.s, sess, protocol.SyncRequest{})
+	if len(r.Messages) == 0 {
+		return
+	}
+	sync0(e.t, e.s, sess, protocol.SyncRequest{Ack: lastID(r)})
 }
 
 func (e *sweepEnv) kinds(sess int64) []string {
@@ -63,12 +79,22 @@ func (e *sweepEnv) count(sess int64, kind string) int {
 	return n
 }
 
-func (e *sweepEnv) state(sess int64) string {
-	ch := sync0(e.t, e.s, sess, protocol.SyncRequest{}).Channels
-	if len(ch) != 1 {
-		e.t.Fatalf("want 1 channel, got %+v", ch)
+// disconnected reports whether the broker has marked the session disconnected.
+func (e *sweepEnv) disconnected(sess int64) bool {
+	e.t.Helper()
+	var disc *int64
+	if err := e.s.db.QueryRow("SELECT disconnected_at FROM sessions WHERE id = ?", sess).Scan(&disc); err != nil {
+		e.t.Fatal(err)
 	}
-	return ch[0].State
+	return disc != nil
+}
+
+// wantPeerLeft checks that a send from `from` to name now fails as peer_left.
+func (e *sweepEnv) wantPeerLeft(from int64, name string) {
+	e.t.Helper()
+	if err := e.s.Send(bg, from, name, "x"); !errors.Is(err, ErrPeerLeft) {
+		e.t.Fatalf("send to %q: %v, want ErrPeerLeft", name, err)
+	}
 }
 
 // disconnectA advances time so that only b stays seen, and sweeps once.
@@ -80,7 +106,7 @@ func (e *sweepEnv) disconnectA(b int64) {
 
 func TestDisconnectEmittedExactlyOnce(t *testing.T) {
 	e := newSweepEnv(t)
-	_, b, _ := e.pair()
+	a, b := e.pair()
 	e.disconnectA(b)
 	for i := 0; i < 3; i++ {
 		e.clk.Advance(15 * time.Second)
@@ -90,17 +116,17 @@ func TestDisconnectEmittedExactlyOnce(t *testing.T) {
 	if n := e.count(b, protocol.KindPeerDisconnected); n != 1 {
 		t.Fatalf("peer_disconnected emitted %d times", n)
 	}
-	if e.state(b) != protocol.StatePeerDisconnected {
-		t.Fatalf("state %s", e.state(b))
+	if !e.disconnected(a) {
+		t.Fatal("a not marked disconnected")
 	}
 }
 
-func TestReconnectWithinGraceKeepsMembershipAndMessages(t *testing.T) {
+func TestReconnectWithinGraceKeepsNameAndMessages(t *testing.T) {
 	e := newSweepEnv(t)
-	a, b, ha := e.pair()
+	a, b := e.pair()
 	e.disconnectA(b)
 	// b sends while a is disconnected: accepted and queued
-	if err := e.s.Send(bg, b, "h/a", "while away"); err != nil {
+	if err := e.s.Send(bg, b, "alice", "while away"); err != nil {
 		t.Fatal(err)
 	}
 	e.clk.Advance(2 * time.Minute)
@@ -110,15 +136,15 @@ func TestReconnectWithinGraceKeepsMembershipAndMessages(t *testing.T) {
 	if n := e.count(b, protocol.KindPeerReconnected); n != 1 {
 		t.Fatalf("peer_reconnected emitted %d times", n)
 	}
-	if e.state(b) != protocol.StateConnected {
-		t.Fatalf("state %s", e.state(b))
+	if e.disconnected(a) {
+		t.Fatal("a still marked disconnected")
 	}
 	ks := e.kinds(a)
-	if len(ks) != 2 || ks[0] != protocol.KindPeerJoined || ks[1] != protocol.KindText {
+	if len(ks) != 1 || ks[0] != protocol.KindText {
 		t.Fatalf("a's queued rows: %v", ks)
 	}
-	if err := e.s.Send(bg, a, ha, "x"); err != nil {
-		t.Fatalf("membership lost: %v", err)
+	if err := e.s.Send(bg, a, "bob", "x"); err != nil {
+		t.Fatalf("name lost: %v", err)
 	}
 	// more sweeps do not emit again
 	e.tr.Touch(a)
@@ -131,7 +157,7 @@ func TestReconnectWithinGraceKeepsMembershipAndMessages(t *testing.T) {
 
 func TestRequestBeforeReapDeadlineReconnectWins(t *testing.T) {
 	e := newSweepEnv(t)
-	a, b, _ := e.pair()
+	a, b := e.pair()
 	e.disconnectA(b)
 	e.clk.Advance(protocol.DisconnectGrace + time.Second) // past the reap deadline
 	e.tr.Touch(a)                                         // a request arrives just before the sweep
@@ -140,14 +166,14 @@ func TestRequestBeforeReapDeadlineReconnectWins(t *testing.T) {
 	if _, err := e.s.Sync(bg, a, protocol.SyncRequest{}); err != nil {
 		t.Fatalf("session reaped from under a live request: %v", err)
 	}
-	if e.state(b) != protocol.StateConnected {
-		t.Fatalf("state %s", e.state(b))
+	if e.disconnected(a) {
+		t.Fatal("a still marked disconnected")
 	}
 }
 
 func TestReapAfterGrace(t *testing.T) {
 	e := newSweepEnv(t)
-	a, b, _ := e.pair()
+	a, b := e.pair()
 	e.disconnectA(b)
 	e.clk.Advance(protocol.DisconnectGrace + time.Second)
 	e.tr.Touch(b)
@@ -155,9 +181,10 @@ func TestReapAfterGrace(t *testing.T) {
 	if _, err := e.s.Sync(bg, a, protocol.SyncRequest{}); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("reaped session still exists: %v", err)
 	}
-	if e.count(b, protocol.KindPeerLeft) != 1 || e.state(b) != protocol.StatePeerLeft {
-		t.Fatalf("peer not told: %v / %s", e.kinds(b), e.state(b))
+	if e.count(b, protocol.KindPeerLeft) != 1 {
+		t.Fatalf("peer not told: %v", e.kinds(b))
 	}
+	e.wantPeerLeft(b, "alice")
 	if !e.tr.Get(a).IsZero() {
 		t.Fatal("tracker kept the reaped session")
 	}
@@ -167,46 +194,9 @@ func TestReapAfterGrace(t *testing.T) {
 	}
 }
 
-func TestChannelTTLExpiry(t *testing.T) {
-	e := newSweepEnv(t)
-	a, b := e.session(), e.session()
-	id, ha := mustCreate(t, e.s, a, "h/a")
-	if err := e.s.Send(bg, a, ha, "held"); err != nil {
-		t.Fatal(err)
-	}
-	e.clk.Advance(protocol.ChannelTTL + time.Second)
-	e.tr.Touch(a)
-	e.tr.Touch(b)
-	e.sweep()
-	e.sweep() // exactly once
-	if e.count(a, protocol.KindChannelExpired) != 1 {
-		t.Fatalf("creator rows: %v", e.kinds(a))
-	}
-	if e.state(a) != protocol.StateExpired {
-		t.Fatalf("state %s", e.state(a))
-	}
-	var held int
-	e.s.db.QueryRow("SELECT COUNT(*) FROM held").Scan(&held)
-	if held != 0 {
-		t.Fatal("held rows survived expiry")
-	}
-	wantCode(t, e.s.Send(bg, a, ha, "x"), ErrExpired)
-	_, _, _, err := e.s.JoinChannel(bg, b, id, "h/b")
-	wantCode(t, err, ErrNoOpen)
-	// The creator leaving removes the expired channel.
-	if err := e.s.Leave(bg, a, ha); err != nil {
-		t.Fatal(err)
-	}
-	var n int
-	e.s.db.QueryRow("SELECT COUNT(*) FROM channels").Scan(&n)
-	if n != 0 {
-		t.Fatal("expired channel not deleted when the creator left")
-	}
-}
-
 func TestRestartReapsNoLiveSession(t *testing.T) {
 	e := newSweepEnv(t)
-	a, b, _ := e.pair()
+	a, b := e.pair()
 	e.clk.Advance(10 * time.Minute) // broker was down
 	e.tr = NewTracker(e.clk.Now)    // restart
 	e.sw = NewSweeper(e.s, e.tr, quiet)
@@ -219,14 +209,14 @@ func TestRestartReapsNoLiveSession(t *testing.T) {
 			t.Fatalf("live session reaped after restart: %v", err)
 		}
 	}
-	if e.state(a) != protocol.StateConnected || e.count(a, protocol.KindPeerDisconnected) != 0 {
+	if e.disconnected(a) || e.count(a, protocol.KindPeerDisconnected) != 0 {
 		t.Fatal("live session disconnected on first sweep after restart")
 	}
 }
 
 func TestRestartKeepsStoredDisconnect(t *testing.T) {
 	e := newSweepEnv(t)
-	_, b, _ := e.pair()
+	a, b := e.pair()
 	e.disconnectA(b)
 	e.clk.Advance(time.Second)
 	e.tr = NewTracker(e.clk.Now) // restart
@@ -238,15 +228,13 @@ func TestRestartKeepsStoredDisconnect(t *testing.T) {
 	if e.count(b, protocol.KindPeerReconnected) != 0 {
 		t.Fatal("restart produced a spurious peer_reconnected")
 	}
-	if e.state(b) != protocol.StatePeerDisconnected {
-		t.Fatalf("state %s", e.state(b))
+	if !e.disconnected(a) {
+		t.Fatal("restart lost the stored disconnect")
 	}
 	e.clk.Advance(protocol.DisconnectGrace)
 	e.tr.Touch(b)
 	e.sweep()
-	if e.state(b) != protocol.StatePeerLeft {
-		t.Fatalf("not reaped on schedule: %s", e.state(b))
-	}
+	e.wantPeerLeft(b, "alice")
 }
 
 func TestUnusedSessionDisconnectedThenReaped(t *testing.T) {
@@ -292,30 +280,31 @@ func TestSessionAfterHighestDeletedStaysConnected(t *testing.T) {
 
 func TestPeerStateMatchesLastEvent(t *testing.T) {
 	e := newSweepEnv(t)
-	a, b, _ := e.pair()
+	a, b := e.pair()
 	last := func() string {
 		ks := e.kinds(b)
 		return ks[len(ks)-1]
 	}
-	if e.state(b) != protocol.StateConnected {
+	if e.disconnected(a) {
 		t.Fatal("initial state")
 	}
 	e.disconnectA(b)
-	if last() != protocol.KindPeerDisconnected || e.state(b) != protocol.StatePeerDisconnected {
-		t.Fatalf("after disconnect: %s / %s", last(), e.state(b))
+	if last() != protocol.KindPeerDisconnected || !e.disconnected(a) {
+		t.Fatalf("after disconnect: %s / %v", last(), e.disconnected(a))
 	}
 	e.clk.Advance(time.Second)
 	e.tr.Touch(a)
 	e.sweep()
-	if last() != protocol.KindPeerReconnected || e.state(b) != protocol.StateConnected {
-		t.Fatalf("after reconnect: %s / %s", last(), e.state(b))
+	if last() != protocol.KindPeerReconnected || e.disconnected(a) {
+		t.Fatalf("after reconnect: %s / %v", last(), e.disconnected(a))
 	}
-	if err := e.s.Leave(bg, a, "h/b"); err != nil {
+	if _, err := e.s.ReleaseName(bg, a); err != nil {
 		t.Fatal(err)
 	}
-	if last() != protocol.KindPeerLeft || e.state(b) != protocol.StatePeerLeft {
-		t.Fatalf("after leave: %s / %s", last(), e.state(b))
+	if last() != protocol.KindPeerLeft {
+		t.Fatalf("after release: %s", last())
 	}
+	e.wantPeerLeft(b, "alice")
 }
 
 func TestSweeperRunSweepsOnItsInterval(t *testing.T) {
@@ -386,7 +375,7 @@ func TestSweepExpiresPendingAndPrunesRetired(t *testing.T) {
 
 func TestReapEmitsPeerLeftNotPeerRemoved(t *testing.T) {
 	e := newSweepEnv(t)
-	a, b, _ := e.pair()
+	_, b := e.pair()
 	e.disconnectA(b) // a goes quiet; b stays seen
 	e.clk.Advance(protocol.DisconnectGrace + time.Second)
 	e.tr.Touch(b)
@@ -394,25 +383,88 @@ func TestReapEmitsPeerLeftNotPeerRemoved(t *testing.T) {
 	if e.count(b, protocol.KindPeerLeft) != 1 || e.count(b, protocol.KindPeerRemoved) != 0 {
 		t.Fatalf("b rows: %v", e.kinds(b))
 	}
-	if e.state(b) != protocol.StatePeerLeft {
-		t.Fatalf("state %s", e.state(b))
-	}
-	_ = a
+	e.wantPeerLeft(b, "alice")
 }
 
-func TestDisconnectEventsCarryAccount(t *testing.T) {
+func TestDisconnectEventsCarryAccountAndName(t *testing.T) {
 	e := newSweepEnv(t)
-	a, b, _ := e.pair()
-	_ = a
+	_, b := e.pair()
 	e.disconnectA(b)
 	r := sync0(t, e.s, b, protocol.SyncRequest{})
 	var found bool
 	for _, m := range r.Messages {
 		if m.Kind == protocol.KindPeerDisconnected {
-			found = m.FromAccount != nil && *m.FromAccount != ""
+			found = m.FromAccount != nil && *m.FromAccount != "" && strp(m.From) == "alice"
+			if protocol.IsWaking(m.Kind) {
+				t.Fatal("peer_disconnected must not wake")
+			}
 		}
 	}
 	if !found {
-		t.Fatalf("peer_disconnected without from_account: %+v", r.Messages)
+		t.Fatalf("peer_disconnected without from and from_account: %+v", r.Messages)
+	}
+}
+
+func TestPresenceEventsGoToPartnersOnly(t *testing.T) {
+	e := newSweepEnv(t)
+	a, b := e.pair()
+	c := e.session()
+	claimAs(t, e.s, c, "carol") // named, but never exchanged a message with a
+	e.clk.Advance(protocol.DisconnectAfter + time.Second)
+	e.tr.Touch(b)
+	e.tr.Touch(c)
+	e.sweep()
+	if !e.disconnected(a) {
+		t.Fatal("setup: a should be disconnected")
+	}
+	if e.count(b, protocol.KindPeerDisconnected) != 1 {
+		t.Fatalf("partner not told: %v", e.kinds(b))
+	}
+	if ks := e.kinds(c); len(ks) != 0 {
+		t.Fatalf("a non-partner was told: %v", ks)
+	}
+	e.clk.Advance(time.Second)
+	e.tr.Touch(a)
+	e.sweep()
+	if ks := e.kinds(c); len(ks) != 0 {
+		t.Fatalf("a non-partner was told about the reconnect: %v", ks)
+	}
+}
+
+func TestDisconnectOfAnUnnamedSessionTellsNobody(t *testing.T) {
+	e := newSweepEnv(t)
+	_, b := e.pair()
+	c := e.session() // never claims a name
+	e.clk.Advance(protocol.DisconnectAfter + time.Second)
+	e.tr.Touch(b)
+	e.sweep()
+	if !e.disconnected(c) {
+		t.Fatal("setup: c should be disconnected")
+	}
+	if ks := e.kinds(b); len(ks) != 1 || ks[0] != protocol.KindPeerDisconnected {
+		t.Fatalf("b rows: %v (only a's disconnect expected)", ks)
+	}
+}
+
+func TestReapFreesTheNameAndRecordsTheDeparture(t *testing.T) {
+	e := newSweepEnv(t)
+	_, b := e.pair()
+	e.disconnectA(b)
+	e.clk.Advance(protocol.DisconnectGrace + time.Second)
+	e.tr.Touch(b)
+	e.sweep()
+	if e.count(b, protocol.KindPeerLeft) != 1 {
+		t.Fatalf("partner not told: %v", e.kinds(b))
+	}
+	var kind string
+	if err := e.s.db.QueryRow("SELECT kind FROM departed WHERE session_id = ? AND name_key = 'alice'", b).Scan(&kind); err != nil || kind != protocol.KindPeerLeft {
+		t.Fatalf("departed row: %q, %v", kind, err)
+	}
+	// The name is free: another session claims it, and b's next send reaches it.
+	d := e.session()
+	claimAs(t, e.s, d, "alice")
+	mustSend(t, e.s, b, "alice", "who is this?")
+	if got := inboxOf(t, e.s, d); len(got) != 1 || !got[0].FirstContact {
+		t.Fatalf("new holder rows: %+v", got)
 	}
 }

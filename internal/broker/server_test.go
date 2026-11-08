@@ -105,21 +105,22 @@ func errCode(b []byte) string {
 	return e.Error.Code
 }
 
-func (e *httpEnv) create(tok, label string) protocol.CreateChannelResponse {
+func (e *httpEnv) claim(tok, name string) (int, []byte) {
+	return e.do(tok, "POST", "/v1/name", protocol.ClaimNameRequest{Name: name})
+}
+
+// claimOK claims name for the session and fails the test unless it is granted.
+func (e *httpEnv) claimOK(tok, name string) {
 	e.t.Helper()
-	code, b := e.do(tok, "POST", "/v1/channels", protocol.CreateChannelRequest{Label: label})
-	if code != 201 {
-		e.t.Fatalf("create channel: %d %s", code, b)
+	code, b := e.claim(tok, name)
+	if code != 200 {
+		e.t.Fatalf("claim %q: %d %s", name, code, b)
 	}
-	var r protocol.CreateChannelResponse
-	json.Unmarshal(b, &r)
-	return r
 }
 
-func (e *httpEnv) join(tok, id, label string) (int, []byte) {
-	return e.do(tok, "POST", "/v1/channels/join", protocol.JoinChannelRequest{ChannelID: id, Label: label})
+func (e *httpEnv) send(tok, to, text string) (int, []byte) {
+	return e.do(tok, "POST", "/v1/messages", protocol.SendRequest{To: to, Text: text})
 }
-
 func (e *httpEnv) sync(tok string, req protocol.SyncRequest) (int, protocol.SyncResponse, []byte) {
 	code, b := e.do(tok, "POST", "/v1/sync", req)
 	var r protocol.SyncResponse
@@ -132,62 +133,105 @@ func (e *httpEnv) sync(tok string, req protocol.SyncRequest) (int, protocol.Sync
 func TestRoutesSuccessAndErrors(t *testing.T) {
 	e := newHTTPEnv(t)
 	a, b := e.session(), e.session()
-	ch := e.create(a, "h/a")
-	if code, body := e.join(b, ch.ChannelID, "h/b"); code != 200 || !strings.Contains(string(body), `"peer_label":"h/a"`) {
-		t.Fatalf("join: %d %s", code, body)
+	if code, body := e.claim(a, "alice"); code != 200 || !strings.Contains(string(body), `"name":"alice"`) {
+		t.Fatalf("claim: %d %s", code, body)
 	}
-	if code, body := e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: "h/b", Text: "hi"}); code != 202 {
+	e.claimOK(b, "bob")
+	if code, body := e.claim(a, "Alice"); code != 200 || !strings.Contains(string(body), `"name":"alice"`) {
+		t.Fatalf("claiming the held name again: %d %s", code, body)
+	}
+	if code, body := e.send(a, "bob", "hi"); code != 202 {
 		t.Fatalf("send: %d %s", code, body)
 	}
-	_, r, _ := e.sync(b, protocol.SyncRequest{})
-	if len(r.Messages) != 1 || r.Messages[0].Text != "hi" || len(r.Channels) != 1 || r.Channels[0].State != protocol.StateConnected {
+	code, raw := e.do(b, "POST", "/v1/sync", protocol.SyncRequest{})
+	if code != 200 {
+		t.Fatalf("sync: %d %s", code, raw)
+	}
+	var r protocol.SyncResponse
+	json.Unmarshal(raw, &r)
+	if len(r.Messages) != 1 || r.Messages[0].Text != "hi" || strp(r.Messages[0].From) != "alice" ||
+		strp(r.Messages[0].FromAccount) == "<nil>" || !r.Messages[0].FirstContact || r.Name != "bob" {
 		t.Fatalf("sync: %+v", r)
 	}
-	// errors
-	if code, body := e.join(b, ch.ChannelID, "h/c"); code != 404 || errCode(body) != protocol.CodeNoOpenChannel {
-		t.Fatalf("join full: %d %s", code, body)
+	// The wire format has no channel or handle left in it.
+	for _, gone := range []string{`"handle"`, `"channels"`, `"from_label"`, `"peer_label"`} {
+		if strings.Contains(string(raw), gone) {
+			t.Fatalf("sync JSON still carries %s: %s", gone, raw)
+		}
 	}
-	if code, body := e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: "h/zzz", Text: "x"}); code != 404 ||
-		errCode(body) != protocol.CodeUnknownPeer || !strings.Contains(string(body), "known_peers") {
+	for _, want := range []string{`"from":"alice"`, `"first_contact":true`, `"name":"bob"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("sync JSON lacks %s: %s", want, raw)
+		}
+	}
+	// claim errors
+	if code, body := e.claim(b, "alice"); code != 409 || errCode(body) != protocol.CodeNameHeld {
+		t.Fatalf("claim a second name: %d %s", code, body)
+	}
+	c := e.session()
+	if code, body := e.claim(c, "ALICE"); code != 409 || errCode(body) != protocol.CodeNameTaken {
+		t.Fatalf("claim a taken name: %d %s", code, body)
+	}
+	if code, body := e.claim(c, "admin"); code != 400 || errCode(body) != protocol.CodeBadName {
+		t.Fatalf("claim a reserved name: %d %s", code, body)
+	}
+	if code, body := e.claim(c, "a/b"); code != 400 || errCode(body) != protocol.CodeBadName {
+		t.Fatalf("claim an invalid name: %d %s", code, body)
+	}
+	if code, body := e.do(c, "POST", "/v1/name", "{"); code != 400 || errCode(body) != protocol.CodeBadRequest {
+		t.Fatalf("claim malformed: %d %s", code, body)
+	}
+	// send errors
+	if code, body := e.send(c, "alice", "x"); code != 409 || errCode(body) != protocol.CodeNoName {
+		t.Fatalf("send without a name: %d %s", code, body)
+	}
+	if code, body := e.send(a, "zzz", "x"); code != 404 || errCode(body) != protocol.CodeUnknownPeer || strings.Contains(string(body), "known_peers") {
 		t.Fatalf("unknown peer: %d %s", code, body)
 	}
-	if code, body := e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: "h/b", Text: ""}); code != 400 || errCode(body) != protocol.CodeEmpty {
+	if code, body := e.send(a, "bob", ""); code != 400 || errCode(body) != protocol.CodeEmpty {
 		t.Fatalf("empty: %d %s", code, body)
+	}
+	if code, body := e.send(a, "ALICE", "x"); code != 400 || errCode(body) != protocol.CodeSelfSend {
+		t.Fatalf("self send: %d %s", code, body)
+	}
+	if code, body := e.send(a, "b/b", "x"); code != 400 || errCode(body) != protocol.CodeBadName {
+		t.Fatalf("send to an invalid name: %d %s", code, body)
 	}
 	if code, body := e.do(a, "POST", "/v1/messages", "{"); code != 400 || errCode(body) != protocol.CodeBadRequest {
 		t.Fatalf("malformed: %d %s", code, body)
 	}
-	e.create(b, "h/b2")
-	if code, body := e.do(a, "POST", "/v1/leave", protocol.LeaveRequest{To: "h/b"}); code != 204 {
-		t.Fatalf("leave: %d %s", code, body)
+	// release
+	if code, body := e.do(b, "DELETE", "/v1/name", nil); code != 200 || !strings.Contains(string(body), `"released":"bob"`) {
+		t.Fatalf("release: %d %s", code, body)
 	}
-	if code, body := e.do(b, "POST", "/v1/messages", protocol.SendRequest{To: "h/a", Text: "x"}); code != 410 || errCode(body) != protocol.CodePeerLeft {
-		t.Fatalf("send to left peer: %d %s", code, body)
+	if code, body := e.do(b, "DELETE", "/v1/name", nil); code != 200 || !strings.Contains(string(body), `"released":""`) {
+		t.Fatalf("second release: %d %s", code, body)
 	}
-	if code, body := e.do(a, "POST", "/v1/leave", protocol.LeaveRequest{To: "h/b"}); code != 404 || errCode(body) != protocol.CodeUnknownPeer {
-		t.Fatalf("leave unknown: %d %s", code, body)
-	}
-	// duplicate peer / same label
-	x, y := e.session(), e.session()
-	c1 := e.create(x, "h/x")
-	if code, body := e.join(x, c1.ChannelID, "h/y"); code != 400 || errCode(body) != protocol.CodeSameLabel {
-		t.Fatalf("same label: %d %s", code, body)
-	}
-	e.join(y, c1.ChannelID, "h/y")
-	c2 := e.create(x, "h/x2")
-	if code, body := e.join(y, c2.ChannelID, "h/y"); code != 409 || errCode(body) != protocol.CodeDuplicatePeer {
-		t.Fatalf("duplicate: %d %s", code, body)
+	if code, body := e.send(a, "bob", "x"); code != 410 || errCode(body) != protocol.CodePeerLeft {
+		t.Fatalf("send to a peer that released: %d %s", code, body)
 	}
 	// clean exit
-	if code, _ := e.do(y, "DELETE", "/v1/sessions/self", nil); code != 204 {
+	if code, _ := e.do(a, "DELETE", "/v1/sessions/self", nil); code != 204 {
 		t.Fatalf("delete self: %d", code)
 	}
 }
 
+func TestRemovedChannelRoutesAnswerUpgradeRequired(t *testing.T) {
+	e := newHTTPEnv(t)
+	tok := e.session()
+	for _, rt := range [][2]string{{"POST", "/v1/channels"}, {"POST", "/v1/channels/join"}, {"POST", "/v1/leave"}} {
+		for _, token := range []string{"", "not-a-token", tok} {
+			code, body := e.do(token, rt[0], rt[1], struct{}{})
+			if code != 410 || errCode(body) != protocol.CodeUpgradeRequired || !strings.Contains(string(body), "upgrade agent-bus") {
+				t.Errorf("%s %s with token %q: %d %s", rt[0], rt[1], token, code, body)
+			}
+		}
+	}
+}
 func TestUnauthorized(t *testing.T) {
 	e := newHTTPEnv(t)
-	for _, rt := range [][2]string{{"POST", "/v1/channels"}, {"POST", "/v1/channels/join"}, {"POST", "/v1/messages"},
-		{"POST", "/v1/leave"}, {"POST", "/v1/sync"}, {"DELETE", "/v1/sessions/self"}} {
+	for _, rt := range [][2]string{{"POST", "/v1/name"}, {"DELETE", "/v1/name"}, {"POST", "/v1/messages"},
+		{"POST", "/v1/sync"}, {"DELETE", "/v1/sessions/self"}} {
 		if code, body := e.do("", rt[0], rt[1], struct{}{}); code != 401 || errCode(body) != protocol.CodeUnauthorized {
 			t.Errorf("%s %s without token: %d %s", rt[0], rt[1], code, body)
 		}
@@ -239,7 +283,7 @@ func notYet(t *testing.T, ch <-chan syncResult) {
 func TestSyncReturnsImmediatelyWhenVersionBehind(t *testing.T) {
 	e := newHTTPEnv(t)
 	a := e.session()
-	e.create(a, "h/a") // bumps the version to 1
+	e.claimOK(a, "alice") // bumps the version to 1
 	start := time.Now()
 	code, r, _ := e.sync(a, protocol.SyncRequest{Version: 0, Wait: 20})
 	if code != 200 || r.Version != 1 || time.Since(start) > 2*time.Second {
@@ -247,43 +291,42 @@ func TestSyncReturnsImmediatelyWhenVersionBehind(t *testing.T) {
 	}
 }
 
-func TestSyncWakesOnSendJoinAndLeave(t *testing.T) {
+func TestSyncWakesOnSendReleaseAndClaim(t *testing.T) {
 	e := newHTTPEnv(t)
 	a, b := e.session(), e.session()
-	ch := e.create(a, "h/a")
-	_, base, _ := e.sync(a, protocol.SyncRequest{})
+	e.claimOK(a, "alice")
+	e.claimOK(b, "bob")
 
-	// join wakes the creator
-	w := asyncSync(e, a, protocol.SyncRequest{Version: base.Version, Wait: 20})
-	notYet(t, w)
-	e.join(b, ch.ChannelID, "h/b")
-	got := await(t, w)
-	if got.code != 200 || len(got.resp.Messages) != 1 || got.resp.Messages[0].Kind != protocol.KindPeerJoined {
-		t.Fatalf("join wake: %+v", got)
-	}
-	cur := got.resp
-
-	// send mid-wait wakes the receiver
+	// a send mid-wait wakes the receiver
 	_, rb, _ := e.sync(b, protocol.SyncRequest{})
-	w = asyncSync(e, b, protocol.SyncRequest{Ack: 0, After: lastID(rb), Version: rb.Version, Wait: 20})
+	w := asyncSync(e, b, protocol.SyncRequest{After: lastID(rb), Version: rb.Version, Wait: 20})
 	notYet(t, w)
-	e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: "h/b", Text: "ping"})
-	got = await(t, w)
+	e.send(a, "bob", "ping")
+	got := await(t, w)
 	if len(got.resp.Messages) != 1 || got.resp.Messages[0].Text != "ping" {
 		t.Fatalf("send wake: %+v", got)
 	}
 
-	// the caller's own leave wakes its own long-poll (channel list changed)
-	last := lastID(cur)
-	w = asyncSync(e, a, protocol.SyncRequest{After: last, Version: cur.Version, Wait: 20})
+	// a partner's release wakes the other side with peer_left
+	w = asyncSync(e, b, protocol.SyncRequest{After: lastID(got.resp), Version: got.resp.Version, Wait: 20})
 	notYet(t, w)
-	e.do(a, "POST", "/v1/leave", protocol.LeaveRequest{To: "h/b"})
+	e.do(a, "DELETE", "/v1/name", nil)
 	got = await(t, w)
-	if got.code != 200 || len(got.resp.Channels) != 0 {
-		t.Fatalf("own leave wake: %+v", got)
+	if got.code != 200 || len(got.resp.Messages) != 1 || got.resp.Messages[0].Kind != protocol.KindPeerLeft {
+		t.Fatalf("release wake: %+v", got)
+	}
+
+	// the caller's own claim wakes its own long-poll (the name changed)
+	c := e.session()
+	_, base, _ := e.sync(c, protocol.SyncRequest{})
+	w = asyncSync(e, c, protocol.SyncRequest{Version: base.Version, Wait: 20})
+	notYet(t, w)
+	e.claimOK(c, "carol")
+	got = await(t, w)
+	if got.code != 200 || got.resp.Name != "carol" {
+		t.Fatalf("own claim wake: %+v", got)
 	}
 }
-
 func lastID(r protocol.SyncResponse) int64 {
 	if len(r.Messages) == 0 {
 		return 0
@@ -306,13 +349,13 @@ func TestSyncEmptyAtTimeout(t *testing.T) {
 func TestTwoConcurrentLongPollsBothReturn(t *testing.T) {
 	e := newHTTPEnv(t)
 	a, b := e.session(), e.session()
-	ch := e.create(a, "h/a")
-	e.join(b, ch.ChannelID, "h/b")
+	e.claimOK(a, "alice")
+	e.claimOK(b, "bob")
 	_, base, _ := e.sync(b, protocol.SyncRequest{})
 	w1 := asyncSync(e, b, protocol.SyncRequest{Version: base.Version, Wait: 20})
 	w2 := asyncSync(e, b, protocol.SyncRequest{Version: base.Version, Wait: 20})
 	notYet(t, w1)
-	e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: "h/b", Text: "one"})
+	e.send(a, "bob", "one")
 	for _, w := range []<-chan syncResult{w1, w2} {
 		if got := await(t, w); len(got.resp.Messages) != 1 {
 			t.Fatalf("long-poll: %+v", got)
@@ -338,77 +381,79 @@ func TestLongPollGets401WhenSessionDeleted(t *testing.T) {
 
 func TestMessageSizeLimits(t *testing.T) {
 	e := newHTTPEnv(t)
-	a := e.session()
-	ch := e.create(a, "h/a")
+	a, b := e.session(), e.session()
+	e.claimOK(a, "alice")
+	e.claimOK(b, "bob")
 	// 60 KiB of quotes: the JSON body is ~120 KiB, but the decoded text is under the limit
 	quotes := strings.Repeat(`"`, 60<<10)
-	code, body := e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: ch.Handle, Text: quotes})
+	code, body := e.send(a, "bob", quotes)
 	if code != 202 {
 		t.Fatalf("60 KiB text: %d %s", code, body)
 	}
 	over := strings.Repeat("x", protocol.MaxMessageBytes+1)
-	code, body = e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: ch.Handle, Text: over})
+	code, body = e.send(a, "bob", over)
 	if code != 413 || errCode(body) != protocol.CodeTooLarge || !strings.Contains(string(body), "65536") {
 		t.Fatalf("over limit: %d %s", code, body)
 	}
-	code, _ = e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: ch.Handle, Text: strings.Repeat("y", 2<<20)})
+	code, _ = e.send(a, "bob", strings.Repeat("y", 2<<20))
 	if code != 413 {
 		t.Fatalf("over body limit: %d", code)
 	}
 }
-
-func TestBadLabels(t *testing.T) {
+func TestBadNames(t *testing.T) {
 	e := newHTTPEnv(t)
-	a, b := e.session(), e.session()
-	for _, l := range []string{`h/na"me`, `h/<x>`, "noslash", "h/", "/n", "a/b/c"} {
-		if code, body := e.do(a, "POST", "/v1/channels", protocol.CreateChannelRequest{Label: l}); code != 400 || errCode(body) != protocol.CodeBadLabel {
-			t.Errorf("create %q: %d %s", l, code, body)
+	a := e.session()
+	for _, n := range []string{`na"me`, `<x>`, "no/slash", "", "a b", "é", strings.Repeat("x", 65), "admin", "Agent-Bus"} {
+		if code, body := e.claim(a, n); code != 400 || errCode(body) != protocol.CodeBadName {
+			t.Errorf("claim %q: %d %s", n, code, body)
 		}
 	}
-	ch := e.create(a, "h/a")
-	for _, l := range []string{`h/na"me`, `h/<x>`, "noslash"} {
-		if code, body := e.join(b, ch.ChannelID, l); code != 400 || errCode(body) != protocol.CodeBadLabel {
-			t.Errorf("join %q: %d %s", l, code, body)
-		}
+	if _, r, _ := e.sync(a, protocol.SyncRequest{}); r.Name != "" {
+		t.Fatalf("a refused claim left name %q", r.Name)
 	}
 }
-
 func TestLogsHoldNoSecrets(t *testing.T) {
 	e := newHTTPEnv(t)
 	a, b := e.session(), e.session()
-	ch := e.create(a, "h/a")
-	e.join(b, ch.ChannelID, "h/b")
-	e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: "h/b", Text: "secret text"})
+	e.claimOK(a, "alice")
+	e.claimOK(b, "bob")
+	e.send(a, "bob", "secret text")
 	e.do("bogus-token-value", "POST", "/v1/sync", protocol.SyncRequest{})
 	logs := e.logs.String()
 	if logs == "" {
 		t.Fatal("no logs captured")
 	}
-	for _, secretStr := range []string{ch.ChannelID, a, b, "bogus-token-value", "secret text"} {
+	for _, secretStr := range []string{a, b, "bogus-token-value", "secret text"} {
 		if strings.Contains(logs, secretStr) {
 			t.Fatalf("log contains secret %q", secretStr)
 		}
 	}
 }
-
-func TestChannelExpiredIs410(t *testing.T) {
+func TestSendToAPeerWhoseSessionEndedIs410(t *testing.T) {
 	e := newHTTPEnv(t)
-	a := e.session()
-	ch := e.create(a, "h/a")
-	if _, err := e.s.db.Exec("UPDATE channels SET state = 'expired'"); err != nil {
-		t.Fatal(err)
+	a, b := e.session(), e.session()
+	e.claimOK(a, "alice")
+	e.claimOK(b, "bob")
+	e.send(a, "bob", "hello")
+	if code, _ := e.do(b, "DELETE", "/v1/sessions/self", nil); code != 204 {
+		t.Fatalf("delete self: %d", code)
 	}
-	code, body := e.do(a, "POST", "/v1/messages", protocol.SendRequest{To: ch.Handle, Text: "x"})
-	if code != 410 || errCode(body) != protocol.CodeChannelExpire {
-		t.Fatalf("send to expired channel: %d %s", code, body)
+	code, body := e.send(a, "bob", "x")
+	if code != 410 || errCode(body) != protocol.CodePeerLeft {
+		t.Fatalf("send to an ended session: %d %s", code, body)
+	}
+	// Someone who never talked to bob learns nothing.
+	c := e.session()
+	e.claimOK(c, "carol")
+	if code, body := e.send(c, "bob", "x"); code != 404 || errCode(body) != protocol.CodeUnknownPeer {
+		t.Fatalf("stranger: %d %s", code, body)
 	}
 }
-
 func TestInternalErrorIs500AndHidesDetails(t *testing.T) {
 	e := newHTTPEnv(t)
 	a := e.session()
 	e.s.db.Close() // every store call now fails with a non-*Error
-	code, body := e.do(a, "POST", "/v1/channels", protocol.CreateChannelRequest{Label: "h/a"})
+	code, body := e.claim(a, "alice")
 	if code != 500 && code != 401 {
 		t.Fatalf("got %d %s", code, body)
 	}
@@ -433,7 +478,7 @@ func TestInternalErrorIs500AndHidesDetails(t *testing.T) {
 }
 
 func TestErrorStringAndHTTPServerTimeouts(t *testing.T) {
-	if got := ErrNoOpen.Error(); got != "no_open_channel: no such open channel" {
+	if got := ErrNameTaken.Error(); got != "name_taken: that name is already in use by another session" {
 		t.Fatalf("Error() = %q", got)
 	}
 	ctx, cancel := context.WithCancel(bg)
@@ -552,7 +597,7 @@ func TestCreateSessionCredentialAuth(t *testing.T) {
 	if code, _ := e.do(r.SessionToken, "POST", "/v1/sessions", struct{}{}); code != 401 {
 		t.Fatalf("session token as credential: %d", code)
 	}
-	if code, _ := e.do(cred, "POST", "/v1/channels", protocol.CreateChannelRequest{Label: "h/a"}); code != 401 {
+	if code, _ := e.claim(cred, "alice"); code != 401 {
 		t.Fatalf("credential as session token: %d", code)
 	}
 }

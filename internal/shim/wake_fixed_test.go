@@ -12,6 +12,8 @@ import (
 func TestStatusCarriesCursorAndItChangesAfterRead(t *testing.T) {
 	e := newWakeEnv(t, WakeOptions{})
 	e.link()
+	e.peerSend("hi") // link leaves nothing unread: give the cursor a row to move past
+	e.eventually(func(s Snapshot) bool { return len(s.Rows) > 0 })
 	before := statusOf(t, e.w.Path())
 	if before.Count < 1 {
 		t.Fatalf("status: %+v", before)

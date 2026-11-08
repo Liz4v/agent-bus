@@ -32,23 +32,23 @@ func (c MirrorConfig) withDefaults() MirrorConfig {
 
 // Snapshot is a consistent copy of the mirror's state.
 type Snapshot struct {
-	Gen      int64 // loop generation that supplied Rows
-	Running  bool
-	Rows     []protocol.Message // unread rows, id > cursor, in ID order
-	Channels []protocol.Channel
-	Health   error
-	Cursor   int64 // read cursor, taken under the same lock as Rows
+	Gen     int64 // loop generation that supplied Rows
+	Running bool
+	Rows    []protocol.Message // unread rows, id > cursor, in ID order
+	Name    string             // the name this session holds, "" when none
+	Health  error
+	Cursor  int64 // read cursor, taken under the same lock as Rows
 	// AdminSubscribed is the broker-confirmed admin subscription of the session.
 	AdminSubscribed bool
 }
 
 // Summary is the wake-socket view of the mirror (D7).
 type Summary struct {
-	Count        int      // unread rows of waking kinds
-	From         []string // sender labels of those rows, de-duplicated
-	LiveChannels int      // channels in state waiting, connected or peer_disconnected
-	Health       error
-	Cursor       int64 // read cursor; changes after a read
+	Count  int      // unread rows of waking kinds
+	From   []string // sender names of those rows, de-duplicated
+	Named  bool     // the session holds a name
+	Health error
+	Cursor int64 // read cursor; changes after a read
 	// AdminSubscribed is the broker-confirmed admin subscription of the session.
 	AdminSubscribed bool
 }
@@ -56,7 +56,7 @@ type Summary struct {
 type refreshWaiter struct{ done chan error }
 
 // Mirror is the shim's only caller of POST /v1/sync (I2). It keeps a local
-// copy of the session's inbox (rows above the cursor) and channel list.
+// copy of the session's inbox (rows above the cursor) and its name.
 type Mirror struct {
 	sess *Session
 	c    *client.Client
@@ -70,9 +70,14 @@ type Mirror struct {
 	after    int64
 	version  int64
 	rows     []protocol.Message
-	channels []protocol.Channel
+	name     string
 	health   error
 	adminSub bool
+
+	// discardEpoch counts DiscardPeerRows calls. A sync request records it when
+	// it is sent; a response to a request that predates the latest discard is
+	// dropped, because it may carry rows the broker has since deleted.
+	discardEpoch int64
 
 	waiters    []*refreshWaiter
 	dropWaiter []*refreshWaiter   // waiters of a dropped loop, released once the notice is set
@@ -104,7 +109,7 @@ func (m *Mirror) Changed() <-chan struct{} {
 // resetLocked empties the mirror and its cursors.
 func (m *Mirror) resetLocked() {
 	m.cursor, m.after, m.version = 0, 0, 0
-	m.rows, m.channels, m.health = nil, nil, nil
+	m.rows, m.name, m.health = nil, "", nil
 	m.adminSub = false
 }
 
@@ -153,7 +158,7 @@ func (m *Mirror) haltLocked() {
 func (m *Mirror) drop() DropReport {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	rep := DropReport{HadState: len(m.channels) > 0 || len(m.rows) > 0}
+	rep := DropReport{HadState: m.name != "" || len(m.rows) > 0, Name: m.name}
 	for _, r := range m.rows {
 		if protocol.IsWaking(r.Kind) {
 			rep.UnreadCount++
@@ -194,12 +199,12 @@ func (m *Mirror) Snapshot() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return Snapshot{
-		Gen:      m.gen,
-		Running:  m.running,
-		Rows:     append([]protocol.Message(nil), m.rows...),
-		Channels: append([]protocol.Channel(nil), m.channels...),
-		Health:   m.health,
-		Cursor:   m.cursor,
+		Gen:     m.gen,
+		Running: m.running,
+		Rows:    append([]protocol.Message(nil), m.rows...),
+		Name:    m.name,
+		Health:  m.health,
+		Cursor:  m.cursor,
 
 		AdminSubscribed: m.adminSub,
 	}
@@ -235,12 +240,7 @@ func (m *Mirror) Summary() Summary {
 			sum.From = append(sum.From, l)
 		}
 	}
-	for _, c := range s.Channels {
-		switch c.State {
-		case protocol.StateWaiting, protocol.StateConnected, protocol.StatePeerDisconnected:
-			sum.LiveChannels++
-		}
-	}
+	sum.Named = s.Name != ""
 	sum.Health = s.Health
 	sum.Cursor = s.Cursor
 	sum.AdminSubscribed = s.AdminSubscribed
@@ -283,6 +283,30 @@ func (m *Mirror) Commit(gen, maxID int64) {
 		}
 	}
 	m.rows = keep
+	m.kickLocked()
+	m.notifyLocked()
+}
+
+// DiscardPeerRows drops every local row that belongs to the session's name:
+// everything except registration_pending, which belongs to the hostmaster
+// subscription (N4, N10). release_name calls it after the broker released the
+// name, because the broker deleted those rows on its side but the mirror
+// already holds the ones it synced, and later syncs ask only for rows above
+// `after`. The cursor and `after` are unchanged. It also advances the discard
+// epoch and kicks the loop, so a sync response already in flight (which can
+// carry a row the broker has since deleted, and the old name) is dropped and
+// asked for again.
+func (m *Mirror) DiscardPeerRows() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keep := m.rows[:0:0]
+	for _, r := range m.rows {
+		if r.Kind == protocol.KindRegistrationPending {
+			keep = append(keep, r)
+		}
+	}
+	m.rows = keep
+	m.discardEpoch++
 	m.kickLocked()
 	m.notifyLocked()
 }
@@ -332,6 +356,7 @@ func (m *Mirror) loop(ctx context.Context, gen int64, token string) {
 		immediate := m.kick || len(waiters) > 0
 		m.kick = false
 		req := protocol.SyncRequest{Ack: m.cursor, After: m.after, Version: m.version}
+		epoch := m.discardEpoch
 		pollCtx, cancel := context.WithCancel(ctx)
 		if immediate {
 			req.Wait = 0
@@ -353,6 +378,15 @@ func (m *Mirror) loop(ctx context.Context, gen int64, token string) {
 			}
 			m.mu.Unlock()
 			return
+		}
+		if m.discardEpoch != epoch {
+			// A DiscardPeerRows ran while this request was in flight. Its
+			// response may carry rows the broker has since deleted and the
+			// old name: apply nothing, keep the waiters, and ask again with
+			// the same `after` (the discard already set kick).
+			m.waiters = append(waiters, m.waiters...)
+			m.mu.Unlock()
+			continue
 		}
 		if err != nil && interrupted {
 			// Interrupted by a refresh or commit: discard the response and
@@ -420,7 +454,7 @@ func (m *Mirror) applyLocked(resp protocol.SyncResponse) {
 		}
 	}
 	m.version = resp.Version
-	m.channels = resp.Channels
+	m.name = resp.Name
 	m.adminSub = resp.AdminSubscribed
 	m.health = nil
 }

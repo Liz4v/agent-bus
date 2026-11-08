@@ -3,7 +3,6 @@
 package protocol
 
 import (
-	"regexp"
 	"time"
 )
 
@@ -14,7 +13,6 @@ const (
 	SyncPageBytes   = 1 << 20  // rows returned by one sync
 	ReadPageBytes   = 256 << 10
 
-	ChannelTTL      = time.Hour
 	DisconnectAfter = 60 * time.Second
 	DisconnectGrace = 5 * time.Minute
 	SweepInterval   = 15 * time.Second
@@ -28,67 +26,45 @@ const (
 
 // Error codes carried in ErrorBody.
 const (
-	CodeBadLabel      = "bad_label"
-	CodeNoOpenChannel = "no_open_channel"
-	CodeSameLabel     = "same_label"
-	CodeDuplicatePeer = "duplicate_peer"
-	CodeUnknownPeer   = "unknown_peer"
-	CodePeerLeft      = "peer_left"
-	CodeChannelExpire = "channel_expired"
-	CodePeerRemoved   = "peer_removed"
-	CodeTooLarge      = "too_large"
-	CodeEmpty         = "empty"
-	CodeUnauthorized  = "unauthorized"
-	CodeBadRequest    = "bad_request"
-	CodeInternal      = "internal"
+	CodeBadName         = "bad_name"
+	CodeNameTaken       = "name_taken"
+	CodeNameHeld        = "name_held"
+	CodeNoName          = "no_name"
+	CodeSelfSend        = "self_send"
+	CodeUpgradeRequired = "upgrade_required"
+	CodeUnknownPeer     = "unknown_peer"
+	CodePeerLeft        = "peer_left"
+	CodePeerRemoved     = "peer_removed"
+	CodeTooLarge        = "too_large"
+	CodeEmpty           = "empty"
+	CodeUnauthorized    = "unauthorized"
+	CodeBadRequest      = "bad_request"
+	CodeInternal        = "internal"
 )
 
 // Message kinds.
 const (
 	KindText             = "text"
-	KindPeerJoined       = "peer_joined"
 	KindPeerDisconnected = "peer_disconnected"
 	KindPeerReconnected  = "peer_reconnected"
 	KindPeerLeft         = "peer_left"
-	KindChannelExpired   = "channel_expired"
 	KindPeerRemoved      = "peer_removed"
 	// KindRegistrationPending is an admin event for a subscribed hostmaster
 	// session; its text is the registrant's name.
 	KindRegistrationPending = "registration_pending"
 )
 
-// AdminHandle is the inbox handle of admin events (no channel).
-const AdminHandle = "admin"
-
 // IsWaking reports whether an unread row of this kind should wake an idle
 // session (D6). Disconnect and reconnect events are informational only.
 func IsWaking(kind string) bool {
 	switch kind {
-	case KindText, KindPeerJoined, KindPeerLeft, KindChannelExpired, KindPeerRemoved, KindRegistrationPending:
+	case KindText, KindPeerLeft, KindPeerRemoved, KindRegistrationPending:
 		return true
 	}
 	return false
 }
 
-// Peer states shown to a member (D10).
-const (
-	StateWaiting          = "waiting"
-	StateConnected        = "connected"
-	StatePeerDisconnected = "peer_disconnected"
-	StatePeerLeft         = "peer_left"
-	StatePeerRemoved      = "peer_removed"
-	StateExpired          = "expired"
-)
-
-// LabelPattern is the pattern every label must match (API notes).
-const LabelPattern = `^[A-Za-z0-9._-]{1,253}/[A-Za-z0-9._-]{1,64}$`
-
-var labelRE = regexp.MustCompile(LabelPattern)
-
-// ValidLabel reports whether s is a well-formed label.
-func ValidLabel(s string) bool { return labelRE.MatchString(s) }
-
-// SystemSender is the sender shown for rows that carry no label.
+// SystemSender is the sender shown for rows that carry no name.
 const SystemSender = "agent-bus"
 
 // ErrorBody is the JSON error shape: {"error":{...}}.
@@ -98,17 +74,8 @@ type ErrorBody struct {
 
 // ErrorDetail describes one error.
 type ErrorDetail struct {
-	Code       string      `json:"code"`
-	Message    string      `json:"message"`
-	KnownPeers []KnownPeer `json:"known_peers,omitempty"`
-}
-
-// KnownPeer is one entry of the known_peers list in an unknown_peer error.
-type KnownPeer struct {
-	Handle  string `json:"handle"`
-	Label   string `json:"label,omitempty"`
-	Account string `json:"account,omitempty"`
-	State   string `json:"state"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 // POST /v1/sessions
@@ -118,24 +85,17 @@ type CreateSessionResponse struct {
 	Account      string `json:"account"`
 }
 
-// POST /v1/channels
-type CreateChannelRequest struct {
-	Label string `json:"label"`
+// POST /v1/name
+type ClaimNameRequest struct {
+	Name string `json:"name"`
 }
-type CreateChannelResponse struct {
-	ChannelID string `json:"channel_id"`
-	Handle    string `json:"handle"`
+type ClaimNameResponse struct {
+	Name string `json:"name"`
 }
 
-// POST /v1/channels/join
-type JoinChannelRequest struct {
-	ChannelID string `json:"channel_id"`
-	Label     string `json:"label"`
-}
-type JoinChannelResponse struct {
-	Handle      string `json:"handle"`
-	PeerLabel   string `json:"peer_label"`
-	PeerAccount string `json:"peer_account"`
+// DELETE /v1/name. Released is the name that was held, or "" if none was.
+type ReleaseNameResponse struct {
+	Released string `json:"released"`
 }
 
 // POST /v1/messages
@@ -144,11 +104,6 @@ type SendRequest struct {
 	Text string `json:"text"`
 }
 type SendResponse struct{}
-
-// POST /v1/leave
-type LeaveRequest struct {
-	To string `json:"to"`
-}
 
 // POST /v1/sync. Wait is in seconds.
 type SyncRequest struct {
@@ -160,31 +115,25 @@ type SyncRequest struct {
 
 // Message is one inbox row. At is Unix seconds.
 type Message struct {
-	ID        int64   `json:"id"`
-	Handle    string  `json:"handle"`
-	FromLabel *string `json:"from_label"`
+	ID int64 `json:"id"`
+	// From is the sender's name (nil for rows with no sender).
+	From *string `json:"from"`
 	// FromAccount is the verified account of the sender (nil for admin rows).
 	FromAccount *string `json:"from_account,omitempty"`
 	Kind        string  `json:"kind"`
 	Text        string  `json:"text"`
 	At          int64   `json:"at"`
-}
-
-// Channel is one entry of a session's channel list. CreatedAt is Unix seconds.
-type Channel struct {
-	Handle      string  `json:"handle"`
-	Label       string  `json:"label"`
-	PeerLabel   *string `json:"peer_label"`
-	PeerAccount *string `json:"peer_account,omitempty"`
-	State       string  `json:"state"`
-	CreatedAt   int64   `json:"created_at"`
+	// FirstContact is set on the first text row a session receives from a
+	// given sender session.
+	FirstContact bool `json:"first_contact,omitempty"`
 }
 
 type SyncResponse struct {
 	Version  int64     `json:"version"`
 	Messages []Message `json:"messages"`
 	More     bool      `json:"more"`
-	Channels []Channel `json:"channels"`
+	// Name is the name the session holds, or "" when it holds none.
+	Name string `json:"name"`
 	// AdminSubscribed reports the session's admin notification subscription.
 	AdminSubscribed bool `json:"admin_subscribed,omitempty"`
 }
@@ -198,9 +147,9 @@ const (
 
 // WAIT reply statuses.
 const (
-	WaitPending    = "pending"
-	WaitNoChannels = "no_channels"
-	WaitRearm      = "rearm"
+	WaitPending = "pending"
+	WaitNoName  = "no_name"
+	WaitRearm   = "rearm"
 )
 
 type WaitReply struct {
@@ -211,11 +160,11 @@ type WaitReply struct {
 }
 
 type StatusReply struct {
-	Count        int      `json:"count"`
-	From         []string `json:"from"`
-	LiveChannels int      `json:"live_channels"`
-	Armed        bool     `json:"armed"`
-	Error        *string  `json:"error"`
-	Cursor       int64    `json:"cursor"` // read cursor; changes after a read (additive)
-	Subscribed   bool     `json:"subscribed"`
+	Count      int      `json:"count"`
+	From       []string `json:"from"`
+	Named      bool     `json:"named"`
+	Armed      bool     `json:"armed"`
+	Error      *string  `json:"error"`
+	Cursor     int64    `json:"cursor"` // read cursor; changes after a read (additive)
+	Subscribed bool     `json:"subscribed"`
 }

@@ -1,5 +1,5 @@
 [Unit]
-Description=agent-bus broker (cross-host peer channels for Claude Code)
+Description=agent-bus broker (cross-host peer messaging for Claude Code)
 After=network-online.target
 Wants=network-online.target
 

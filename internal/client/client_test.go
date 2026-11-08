@@ -110,35 +110,70 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("create session: %q %v", account, err)
 	}
 	b := session(t, tb, "bob")
-	ch, err := c.CreateChannel(bg, a, "h/a")
-	if err != nil || ch.ChannelID == "" || ch.Handle == "" {
-		t.Fatalf("create: %+v %v", ch, err)
+	claimed, err := c.ClaimName(bg, a, "alice-s")
+	if err != nil || claimed.Name != "alice-s" {
+		t.Fatalf("claim: %+v %v", claimed, err)
 	}
-	j, err := c.JoinChannel(bg, b, ch.ChannelID, "h/b")
-	if err != nil || j.PeerLabel != "h/a" || j.PeerAccount != "alice" {
-		t.Fatalf("join: %+v %v", j, err)
+	if got, err := c.ClaimName(bg, b, "bob-s"); err != nil || got.Name != "bob-s" {
+		t.Fatalf("claim: %+v %v", got, err)
 	}
-	if err := c.Send(bg, a, "h/b", "hello"); err != nil {
+	if err := c.Send(bg, a, "bob-s", "hello"); err != nil {
 		t.Fatal(err)
 	}
 	r, err := c.Sync(bg, b, protocol.SyncRequest{})
-	if err != nil || len(r.Messages) != 1 || r.Messages[0].Text != "hello" || len(r.Channels) != 1 {
+	if err != nil || len(r.Messages) != 1 || r.Messages[0].Text != "hello" || r.Name != "bob-s" ||
+		r.Messages[0].From == nil || *r.Messages[0].From != "alice-s" || !r.Messages[0].FirstContact ||
+		r.Messages[0].FromAccount == nil || *r.Messages[0].FromAccount != "alice" {
 		t.Fatalf("sync: %+v %v", r, err)
 	}
 	// typed errors
-	err = c.Send(bg, a, "h/nobody", "x")
+	err = c.Send(bg, a, "nobody", "x")
 	var ae *APIError
-	if !errors.As(err, &ae) || ae.Code != protocol.CodeUnknownPeer || len(ae.KnownPeers) != 1 {
+	if !errors.As(err, &ae) || ae.Code != protocol.CodeUnknownPeer || ae.Status != 404 {
 		t.Fatalf("unknown peer: %v", err)
 	}
-	if err := c.Leave(bg, a, "h/b"); err != nil {
-		t.Fatal(err)
+	carol := session(t, tb, "carol")
+	if _, err := c.ClaimName(bg, carol, "ALICE-S"); !errors.As(err, &ae) || ae.Code != protocol.CodeNameTaken {
+		t.Fatalf("taken: %v", err)
 	}
-	if err := c.Send(bg, b, "h/a", "x"); !errors.As(err, &ae) || ae.Code != protocol.CodePeerLeft {
+	if _, err := c.ClaimName(bg, b, "other"); !errors.As(err, &ae) || ae.Code != protocol.CodeNameHeld {
+		t.Fatalf("held: %v", err)
+	}
+	if _, err := c.ClaimName(bg, carol, "admin"); !errors.As(err, &ae) || ae.Code != protocol.CodeBadName {
+		t.Fatalf("reserved: %v", err)
+	}
+	if err := c.Send(bg, carol, "alice-s", "x"); !errors.As(err, &ae) || ae.Code != protocol.CodeNoName {
+		t.Fatalf("no name: %v", err)
+	}
+	rel, err := c.ReleaseName(bg, b)
+	if err != nil || rel.Released != "bob-s" {
+		t.Fatalf("release: %+v %v", rel, err)
+	}
+	if rel, err = c.ReleaseName(bg, b); err != nil || rel.Released != "" {
+		t.Fatalf("second release: %+v %v", rel, err)
+	}
+	if err := c.Send(bg, a, "bob-s", "x"); !errors.As(err, &ae) || ae.Code != protocol.CodePeerLeft {
 		t.Fatalf("peer left: %v", err)
 	}
 	if err := c.DeleteSelf(bg, a); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// An older broker has no /v1/name: its mux answers a plain-text 404, which the
+// client reports as code http_404 so the shim can say the broker is too old
+// (N12). The removed channel routes of a newer broker answer 410.
+func TestUnknownRouteAndRemovedRouteCodes(t *testing.T) {
+	c, _ := newBroker(t)
+	tok, _, _ := c.CreateSession(bg)
+	var ae *APIError
+	err := c.do(bg, tok, "POST", "/v1/no-such-route", struct{}{}, nil, callTimeout)
+	if !errors.As(err, &ae) || ae.Status != 404 || ae.Code != "http_404" || ae.Message == "" {
+		t.Fatalf("unknown route: %+v %v", ae, err)
+	}
+	err = c.do(bg, tok, "POST", "/v1/channels", struct{}{}, nil, callTimeout)
+	if !errors.As(err, &ae) || ae.Status != 410 || ae.Code != protocol.CodeUpgradeRequired {
+		t.Fatalf("removed route: %+v %v", ae, err)
 	}
 }
 
@@ -152,7 +187,7 @@ func TestUnauthorizedMapping(t *testing.T) {
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("got %v, want ErrUnauthorized", err)
 	}
-	if err := c.Leave(bg, "garbage", "h/x"); !errors.Is(err, ErrUnauthorized) {
+	if _, err := c.ClaimName(bg, "garbage", "x"); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("got %v, want ErrUnauthorized", err)
 	}
 }

@@ -237,7 +237,7 @@ func runShim(ctx context.Context, args []string, stderr io.Writer) int {
 		defer w.Close()
 		wakeInfo = w
 	}
-	tools := shim.NewTools(sess, mirror, os.Hostname, wakeInfo, setupErr, hostmaster)
+	tools := shim.NewTools(sess, mirror, wakeInfo, setupErr, hostmaster)
 	srv := tools.NewMCPServer(version)
 	if err := tools.Run(ctx, srv, &mcp.StdioTransport{}); err != nil && ctx.Err() == nil {
 		fmt.Fprintf(stderr, "agent-bus shim: %v\n", err)

@@ -13,22 +13,12 @@ func TestSyncWaitCapBelowDisconnectAfter(t *testing.T) {
 
 func TestIsWaking(t *testing.T) {
 	for kind, want := range map[string]bool{
-		KindText: true, KindPeerJoined: true, KindPeerLeft: true, KindChannelExpired: true,
-		KindPeerDisconnected: false, KindPeerReconnected: false, "bogus": false,
+		KindText: true, KindPeerLeft: true, KindPeerRemoved: true, KindRegistrationPending: true,
+		KindPeerDisconnected: false, KindPeerReconnected: false,
+		"peer_joined": false, "channel_expired": false, "bogus": false, "": false,
 	} {
 		if got := IsWaking(kind); got != want {
 			t.Errorf("IsWaking(%q) = %v, want %v", kind, got, want)
-		}
-	}
-}
-
-func TestValidLabel(t *testing.T) {
-	for s, want := range map[string]bool{
-		"host/name": true, "h.o-s_t/n1": true, "host": false, "host/": false, "/n": false,
-		`ho"st/n`: false, "ho<st/n": false, "a/b/c": false, "host/na me": false,
-	} {
-		if got := ValidLabel(s); got != want {
-			t.Errorf("ValidLabel(%q) = %v, want %v", s, got, want)
 		}
 	}
 }
@@ -54,6 +44,31 @@ func TestValidName(t *testing.T) {
 	} {
 		if got := ValidName(s); got != want {
 			t.Errorf("ValidName(%q) = %v, want %v", s, got, want)
+		}
+	}
+}
+
+func TestNameKey(t *testing.T) {
+	for in, want := range map[string]string{
+		"bob": "bob", "Bob": "bob", "BOB": "bob", "a.B-c_D": "a.b-c_d", "": "",
+	} {
+		if got := NameKey(in); got != want {
+			t.Errorf("NameKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if NameKey("Bob") != NameKey("bOb") {
+		t.Error("names differing only in case must share a key")
+	}
+}
+
+func TestReservedName(t *testing.T) {
+	for s, want := range map[string]bool{
+		"admin": true, "Admin": true, "ADMIN": true,
+		"agent-bus": true, "Agent-Bus": true, "AGENT-BUS": true,
+		"admins": false, "bob": false, "agent": false, "agent-bus2": false, "": false,
+	} {
+		if got := ReservedName(s); got != want {
+			t.Errorf("ReservedName(%q) = %v, want %v", s, got, want)
 		}
 	}
 }

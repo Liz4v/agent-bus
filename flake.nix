@@ -1,5 +1,5 @@
 {
-  description = "agent-bus: cross-host 1-to-1 channels between Claude Code sessions";
+  description = "agent-bus: cross-host 1-to-1 messaging between Claude Code sessions";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 

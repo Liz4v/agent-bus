@@ -84,59 +84,11 @@ func newSessionFor(t *testing.T, s *Store, name string) (session int64, account 
 	return id, acc
 }
 
-// rawJoined creates a joined channel between two sessions with raw SQL, so the
-// store tests do not depend on channels.go. It returns the member rows.
-func rawJoined(t *testing.T, s *Store, a, b int64, la, lb string) (ma, mb member, channel int64) {
-	t.Helper()
-	err := s.update(context.Background(), func(tx *Tx) error {
-		res, err := tx.Exec("INSERT INTO channels(id_hash, created_at, state) VALUES(?,?,'joined')", secret.Hash(secret.NewChannelID()), tx.now)
-		if err != nil {
-			return err
-		}
-		channel, _ = res.LastInsertId()
-		accounts := map[int64]string{}
-		for _, sess := range []int64{a, b} {
-			var n string
-			if err := tx.QueryRow("SELECT a.name FROM sessions s JOIN accounts a ON a.id = s.account_id WHERE s.id = ?", sess).Scan(&n); err != nil {
-				return err
-			}
-			accounts[sess] = n
-		}
-		for i, x := range []struct {
-			sess        int64
-			label, peer string
-			handle      string
-		}{{a, la, lb, "ch-a"}, {b, lb, la, "ch-b"}} {
-			other := a
-			if x.sess == a {
-				other = b
-			}
-			r, err := tx.Exec("INSERT INTO members(channel_id, session_id, label, handle, peer_label, account, peer_account) VALUES(?,?,?,?,?,?,?)",
-				channel, x.sess, x.label, x.handle, x.peer, accounts[x.sess], accounts[other])
-			if err != nil {
-				return err
-			}
-			id, _ := r.LastInsertId()
-			m := member{id: id, channelID: channel, sessionID: x.sess, label: x.label, handle: x.handle, account: accounts[x.sess]}
-			if i == 0 {
-				ma = m
-			} else {
-				mb = m
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return
-}
-
 func enqueueText(t *testing.T, s *Store, session int64, text string) {
 	t.Helper()
-	from := "h/x"
+	from := "x"
 	err := s.update(context.Background(), func(tx *Tx) error {
-		return tx.enqueue(session, "ch-a", &from, nil, protocol.KindText, text)
+		return tx.enqueue(session, &from, nil, protocol.KindText, text, false)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +118,7 @@ func TestMigrationIdempotent(t *testing.T) {
 	}
 	defer s.Close()
 	var v int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 2 {
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 3 {
 		t.Fatalf("user_version = %d, %v", v, err)
 	}
 	var n int
@@ -196,15 +148,47 @@ func TestForeignKeysOnEveryConnection(t *testing.T) {
 	}
 }
 
-func TestRestrictBlocksDeletes(t *testing.T) {
+func TestRestrictBlocksAccountDeleteAndSessionDeleteCascades(t *testing.T) {
+	s, _ := openTestStore(t)
+	a, accA := newSessionFor(t, s, "alice")
+	b := named(t, s, "bob")
+	claimAs(t, s, a, "alice")
+	mustSend(t, s, a, "bob", "hi")
+	if _, err := s.db.Exec("DELETE FROM accounts WHERE id = ?", accA); err == nil {
+		t.Fatal("deleting an account that owns a session must fail")
+	}
+	// A session's inbox, partner rows and departed rows go with it.
+	if _, err := s.db.Exec("INSERT INTO departed(session_id, name_key, kind) VALUES(?, 'x', 'peer_left')", a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("DELETE FROM sessions WHERE id = ?", a); err != nil {
+		t.Fatalf("deleting a session: %v", err)
+	}
+	for _, q := range []string{"SELECT COUNT(*) FROM partners", "SELECT COUNT(*) FROM departed", "SELECT COUNT(*) FROM inbox WHERE session_id = " + fmt.Sprint(a)} {
+		var n int
+		s.db.QueryRow(q).Scan(&n)
+		if n != 0 {
+			t.Fatalf("%s = %d after the session was deleted", q, n)
+		}
+	}
+	if got := inboxOf(t, s, b); len(got) != 1 {
+		t.Fatalf("the peer's own row must survive: %+v", got)
+	}
+}
+
+func TestSessionNameKeyIsUnique(t *testing.T) {
 	s, _ := openTestStore(t)
 	a, b := newSession(t, s), newSession(t, s)
-	_, _, ch := rawJoined(t, s, a, b, "h/a", "h/b")
-	if _, err := s.db.Exec("DELETE FROM sessions WHERE id = ?", a); err == nil {
-		t.Fatal("deleting a session with members must fail")
+	if _, err := s.db.Exec("UPDATE sessions SET name = 'Bob', name_key = 'bob' WHERE id = ?", a); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := s.db.Exec("DELETE FROM channels WHERE id = ?", ch); err == nil {
-		t.Fatal("deleting a channel with members must fail")
+	if _, err := s.db.Exec("UPDATE sessions SET name = 'bob', name_key = 'bob' WHERE id = ?", b); err == nil {
+		t.Fatal("two sessions share a name key")
+	}
+	// Unnamed sessions do not collide: NULL keys are distinct.
+	c, d := newSession(t, s), newSession(t, s)
+	if c == d {
+		t.Fatal("setup")
 	}
 }
 
@@ -246,9 +230,9 @@ func TestSyncCommitOrderedVisibility(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 60; i++ {
-				from := "h/x"
+				from := "x"
 				if err := s.update(ctx, func(tx *Tx) error {
-					return tx.enqueue(a, "ch-a", &from, nil, protocol.KindText, "x")
+					return tx.enqueue(a, &from, nil, protocol.KindText, "x", false)
 				}); err != nil && ctx.Err() == nil {
 					t.Error(err)
 					return
@@ -421,8 +405,8 @@ func TestTxBumpsAndBroadcastsExactlyTheBumped(t *testing.T) {
 func TestDeleteSelf(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()
-	a, b := newSession(t, s), newSession(t, s)
-	rawJoined(t, s, a, b, "h/a", "h/b")
+	a, b := named(t, s, "alice"), named(t, s, "bob")
+	mustSend(t, s, a, "bob", "hi")
 	enqueueText(t, s, a, "queued for a")
 	wake, cancel := s.Notify().Subscribe(a)
 	defer cancel()
@@ -432,12 +416,9 @@ func TestDeleteSelf(t *testing.T) {
 	}
 	recv(t, wake)
 	r := sync0(t, s, b, protocol.SyncRequest{})
-	if len(r.Messages) != 1 || r.Messages[0].Kind != protocol.KindPeerLeft ||
-		r.Messages[0].FromLabel == nil || *r.Messages[0].FromLabel != "h/a" || r.Messages[0].Handle != "ch-b" {
+	last := r.Messages[len(r.Messages)-1]
+	if last.Kind != protocol.KindPeerLeft || strp(last.From) != "alice" || strp(last.FromAccount) != "acct-alice" {
 		t.Fatalf("peer did not get peer_left: %+v", r.Messages)
-	}
-	if len(r.Channels) != 1 || r.Channels[0].State != protocol.StatePeerLeft {
-		t.Fatalf("channel list: %+v", r.Channels)
 	}
 	if _, err := s.Sync(ctx, a, protocol.SyncRequest{}); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("deleted session sync: %v", err)
@@ -447,45 +428,34 @@ func TestDeleteSelf(t *testing.T) {
 	if n != 0 {
 		t.Fatal("inbox survived session deletion")
 	}
-	// b leaves too: the channel is deleted with it.
+	s.db.QueryRow("SELECT COUNT(*) FROM partners").Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d partner rows left behind", n)
+	}
+	// Deleting twice is harmless (the session may already be gone).
+	if err := s.DeleteSelf(ctx, a); err != nil {
+		t.Fatalf("second DeleteSelf: %v", err)
+	}
+	// b leaves too: nobody is left to tell.
 	if err := s.DeleteSelf(ctx, b); err != nil {
 		t.Fatal(err)
 	}
-	s.db.QueryRow("SELECT COUNT(*) FROM channels").Scan(&n)
-	if n != 0 {
-		t.Fatalf("%d channels left behind", n)
-	}
 }
 
-func TestInboxRowsOutliveMembershipAndChannel(t *testing.T) {
+func TestInboxRowsOutliveAPartnersDeparture(t *testing.T) {
 	s, _ := openTestStore(t)
-	ctx := context.Background()
-	a, b := newSession(t, s), newSession(t, s)
-	ma, mb, _ := rawJoined(t, s, a, b, "h/a", "h/b")
-	enqueueText(t, s, a, "queued before leave")
-	// Both sides remove their membership; the channel is deleted.
-	if err := s.update(ctx, func(tx *Tx) error { return tx.removeMember(mb, reasonLeft) }); err != nil {
+	a, b := named(t, s, "alice"), named(t, s, "bob")
+	mustSend(t, s, b, "alice", "queued before leaving")
+	if _, err := s.ReleaseName(bg, b); err != nil {
 		t.Fatal(err)
-	}
-	if err := s.update(ctx, func(tx *Tx) error { return tx.removeMember(ma, reasonLeft) }); err != nil {
-		t.Fatal(err)
-	}
-	var n int
-	s.db.QueryRow("SELECT COUNT(*) FROM channels").Scan(&n)
-	if n != 0 {
-		t.Fatal("channel not deleted")
 	}
 	r := sync0(t, s, a, protocol.SyncRequest{})
-	var texts []string
-	for _, m := range r.Messages {
-		texts = append(texts, m.Kind+":"+m.Text)
-	}
 	found := map[string]bool{}
 	for _, m := range r.Messages {
 		found[m.Kind] = true
 	}
 	if !found[protocol.KindText] || !found[protocol.KindPeerLeft] {
-		t.Fatalf("inbox rows lost with the channel: %v", texts)
+		t.Fatalf("rows lost when the sender left: %v", kinds(r))
 	}
 }
 
@@ -594,7 +564,7 @@ func seedV1(t *testing.T, path string) {
 	}
 }
 
-func TestMigrationV1ToV2DropsDataAndSetsVersion(t *testing.T) {
+func TestMigrationV1ToCurrentDropsDataAndSetsVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v1.db")
 	seedV1(t, path)
 	s, err := OpenStore(path, nil, nil)
@@ -604,13 +574,18 @@ func TestMigrationV1ToV2DropsDataAndSetsVersion(t *testing.T) {
 	defer s.Close()
 	var v int
 	s.db.QueryRow("PRAGMA user_version").Scan(&v)
-	if v != 2 {
-		t.Fatalf("user_version = %d, want 2", v)
+	if v != 3 {
+		t.Fatalf("user_version = %d, want 3", v)
 	}
-	for _, tbl := range []string{"sessions", "channels", "members", "held", "inbox", "accounts", "retired", "settings"} {
+	for _, tbl := range []string{"sessions", "inbox", "partners", "departed", "accounts", "retired", "settings"} {
 		var n int
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM " + tbl).Scan(&n); err != nil || n != 0 {
 			t.Errorf("table %s: count %d, err %v (want present and empty)", tbl, n, err)
+		}
+	}
+	for _, tbl := range []string{"channels", "members", "held"} {
+		if _, err := s.db.Exec("SELECT 1 FROM " + tbl); err == nil {
+			t.Errorf("table %s still exists after the migration", tbl)
 		}
 	}
 	if has, err := s.HasHostmaster(bg); err != nil || has {
@@ -661,42 +636,63 @@ func TestFailedMigrationRollsBackFully(t *testing.T) {
 	}
 }
 
-func TestRemoveMemberReasonRemoved(t *testing.T) {
+func TestDepartReasonRemoved(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()
 	a, _ := newSessionFor(t, s, "alice")
 	b, _ := newSessionFor(t, s, "bob")
-	ma, _, _ := rawJoined(t, s, a, b, "h/a", "h/b")
-	if err := s.update(ctx, func(tx *Tx) error { return tx.removeMember(ma, reasonRemoved) }); err != nil {
+	claimAs(t, s, a, "alice-s")
+	claimAs(t, s, b, "bob-s")
+	mustSend(t, s, a, "bob-s", "hi")
+	if err := s.update(ctx, func(tx *Tx) error { return tx.depart(a, reasonRemoved) }); err != nil {
 		t.Fatal(err)
 	}
 	r := sync0(t, s, b, protocol.SyncRequest{})
-	if len(r.Messages) != 1 || r.Messages[0].Kind != protocol.KindPeerRemoved ||
-		r.Messages[0].FromAccount == nil || *r.Messages[0].FromAccount != "alice" ||
-		r.Messages[0].FromLabel == nil || *r.Messages[0].FromLabel != "h/a" {
+	last := r.Messages[len(r.Messages)-1]
+	if last.Kind != protocol.KindPeerRemoved || strp(last.FromAccount) != "alice" || strp(last.From) != "alice-s" {
 		t.Fatalf("peer_removed row: %+v", r.Messages)
 	}
-	if len(r.Channels) != 1 || r.Channels[0].State != protocol.StatePeerRemoved {
-		t.Fatalf("channel list: %+v", r.Channels)
+	var kind string
+	if err := s.db.QueryRow("SELECT kind FROM departed WHERE session_id = ? AND name_key = 'alice-s'", b).Scan(&kind); err != nil || kind != protocol.KindPeerRemoved {
+		t.Fatalf("departed row: %q, %v", kind, err)
 	}
 }
 
-func TestRemoveMemberReasonLeftKeepsPeerLeft(t *testing.T) {
+func TestDepartReasonLeftKeepsPeerLeft(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()
 	a, _ := newSessionFor(t, s, "alice")
 	b, _ := newSessionFor(t, s, "bob")
-	ma, _, _ := rawJoined(t, s, a, b, "h/a", "h/b")
-	if err := s.update(ctx, func(tx *Tx) error { return tx.removeMember(ma, reasonLeft) }); err != nil {
+	claimAs(t, s, a, "alice-s")
+	claimAs(t, s, b, "bob-s")
+	mustSend(t, s, a, "bob-s", "hi")
+	if err := s.update(ctx, func(tx *Tx) error { return tx.depart(a, reasonLeft) }); err != nil {
 		t.Fatal(err)
 	}
 	r := sync0(t, s, b, protocol.SyncRequest{})
-	if len(r.Messages) != 1 || r.Messages[0].Kind != protocol.KindPeerLeft ||
-		r.Messages[0].FromAccount == nil || *r.Messages[0].FromAccount != "alice" {
+	last := r.Messages[len(r.Messages)-1]
+	if last.Kind != protocol.KindPeerLeft || strp(last.FromAccount) != "alice" {
 		t.Fatalf("peer_left row: %+v", r.Messages)
 	}
-	if r.Channels[0].State != protocol.StatePeerLeft {
-		t.Fatalf("state = %s", r.Channels[0].State)
+	var kind string
+	s.db.QueryRow("SELECT kind FROM departed WHERE session_id = ? AND name_key = 'alice-s'", b).Scan(&kind)
+	if kind != protocol.KindPeerLeft {
+		t.Fatalf("departed kind = %q", kind)
+	}
+}
+
+func TestDepartDoesNothingForAnUnnamedOrMissingSession(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	a := newSession(t, s)
+	b := named(t, s, "bob")
+	for _, session := range []int64{a, 9999} {
+		if err := s.update(ctx, func(tx *Tx) error { return tx.depart(session, reasonLeft) }); err != nil {
+			t.Fatalf("depart(%d): %v", session, err)
+		}
+	}
+	if got := inboxOf(t, s, b); len(got) != 0 {
+		t.Fatalf("a bystander was told: %+v", got)
 	}
 }
 
@@ -708,5 +704,143 @@ func TestCreateSessionRequiresActiveAccount(t *testing.T) {
 	}
 	if _, _, err := s.CreateSession(bg, 9999); err == nil {
 		t.Fatal("a missing account got a session")
+	}
+}
+
+// seedV2 builds a version 2 database (accounts, plus channels, held rows and
+// handles) the way the multi-user release left it.
+func seedV2(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, q := range []string{
+		schemaV2,
+		"INSERT INTO accounts(name, name_key, cred_hash, status, is_hostmaster, created_at) VALUES('keeper','keeper',x'0a','active',1,1)",
+		"INSERT INTO accounts(name, name_key, cred_hash, status, is_hostmaster, created_at) VALUES('liz','liz',x'0b','active',0,1)",
+		"INSERT INTO retired(cred_hash, name, outcome, at) VALUES(x'0c','gone','removed',1)",
+		"INSERT INTO settings(key, value) VALUES('max_accounts','7')",
+		"INSERT INTO sessions(token_hash, account_id, created_at) VALUES(x'01', 2, 1)",
+		"INSERT INTO channels(id_hash, created_at, state) VALUES(x'02', 1, 'open')",
+		"INSERT INTO members(channel_id, session_id, label, handle, account) VALUES(1, 1, 'h/a', 'ch-a', 'liz')",
+		"INSERT INTO held(channel_id, from_label, from_account, text, at) VALUES(1, 'h/a', 'liz', 'held', 1)",
+		"INSERT INTO inbox(session_id, handle, kind, text, at) VALUES(1, 'ch-a', 'text', 'old', 1)",
+		"PRAGMA user_version = 2",
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("seed %q: %v", q, err)
+		}
+	}
+}
+
+func TestMigrationV2ToV3KeepsAccountsAndDropsChannelData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v2.db")
+	seedV2(t, path)
+	s, err := OpenStore(path, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var v int
+	s.db.QueryRow("PRAGMA user_version").Scan(&v)
+	if v != 3 {
+		t.Fatalf("user_version = %d, want 3", v)
+	}
+	counts := map[string]int{"accounts": 2, "retired": 1, "settings": 1, "sessions": 0, "inbox": 0, "partners": 0, "departed": 0}
+	for tbl, want := range counts {
+		var n int
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM " + tbl).Scan(&n); err != nil || n != want {
+			t.Errorf("table %s: count %d, err %v (want %d)", tbl, n, err, want)
+		}
+	}
+	for _, tbl := range []string{"channels", "members", "held"} {
+		if _, err := s.db.Exec("SELECT 1 FROM " + tbl); err == nil {
+			t.Errorf("table %s survived the migration", tbl)
+		}
+	}
+	if has, err := s.HasHostmaster(bg); err != nil || !has {
+		t.Fatalf("the hostmaster must survive: %v %v", has, err)
+	}
+	var max string
+	s.db.QueryRow("SELECT value FROM settings WHERE key = 'max_accounts'").Scan(&max)
+	if max != "7" {
+		t.Fatalf("settings lost: max_accounts = %q", max)
+	}
+	// The upgraded database works: an old account opens a session and claims a name.
+	var id int64
+	if err := s.db.QueryRow("SELECT id FROM accounts WHERE name = 'liz'").Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	_, sess, err := s.CreateSession(bg, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimAs(t, s, sess, "liz-s")
+}
+
+func TestMigrationFreshDatabaseIsV3(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "fresh.db"), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var v int
+	s.db.QueryRow("PRAGMA user_version").Scan(&v)
+	if v != 3 {
+		t.Fatalf("user_version = %d, want 3", v)
+	}
+	for _, tbl := range []string{"accounts", "retired", "settings", "sessions", "partners", "departed", "inbox"} {
+		if _, err := s.db.Exec("SELECT 1 FROM " + tbl); err != nil {
+			t.Errorf("table %s missing: %v", tbl, err)
+		}
+	}
+}
+
+func TestMigrationV3ReopenIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v3.db")
+	s, err := OpenStore(path, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := newSessionFor(t, s, "liz")
+	claimAs(t, s, a, "bob")
+	s.Close()
+	s, err = OpenStore(path, nil, nil)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s.Close()
+	if r := sync0(t, s, a, protocol.SyncRequest{}); r.Name != "bob" {
+		t.Fatalf("a v3 reopen dropped the session or its name: %q", r.Name)
+	}
+}
+
+func TestFailedV3MigrationRollsBackFully(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad3.db")
+	seedV2(t, path)
+	db, _ := sql.Open("sqlite", "file:"+path)
+	// A table the migration wants to create blocks it after the drops.
+	if _, err := db.Exec("CREATE TABLE partners(x)"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if s, err := OpenStore(path, nil, nil); err == nil {
+		s.Close()
+		t.Fatal("expected the migration to fail")
+	}
+	db, _ = sql.Open("sqlite", "file:"+path)
+	defer db.Close()
+	var v, n int
+	db.QueryRow("PRAGMA user_version").Scan(&v)
+	if v != 2 {
+		t.Fatalf("user_version = %d after a failed migration, want 2", v)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM channels").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("channels not restored: %d, %v", n, err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM inbox").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("inbox not restored: %d, %v", n, err)
 	}
 }

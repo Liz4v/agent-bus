@@ -23,11 +23,10 @@ var ErrUnauthorized = errors.New("agent-bus: session unknown to the broker (expi
 // APIError is a broker error response. It maps the broker's error codes onto a
 // typed value; callers switch on Code.
 type APIError struct {
-	Broker     string
-	Status     int
-	Code       string
-	Message    string
-	KnownPeers []protocol.KnownPeer
+	Broker  string
+	Status  int
+	Code    string
+	Message string
 }
 
 func (e *APIError) Error() string {
@@ -118,7 +117,7 @@ func (c *Client) do(ctx context.Context, token, method, path string, in, out any
 		var eb protocol.ErrorBody
 		ae := &APIError{Broker: c.base, Status: resp.StatusCode}
 		if json.Unmarshal(data, &eb) == nil && eb.Error.Code != "" {
-			ae.Code, ae.Message, ae.KnownPeers = eb.Error.Code, eb.Error.Message, eb.Error.KnownPeers
+			ae.Code, ae.Message = eb.Error.Code, eb.Error.Message
 		} else {
 			ae.Code, ae.Message = "http_"+fmt.Sprint(resp.StatusCode), strings.TrimSpace(string(data))
 			if ae.Message == "" {
@@ -152,29 +151,24 @@ func (c *Client) DeleteSelf(ctx context.Context, token string) error {
 	return c.do(ctx, token, "DELETE", "/v1/sessions/self", nil, nil, callTimeout)
 }
 
-// CreateChannel creates a channel under label.
-func (c *Client) CreateChannel(ctx context.Context, token, label string) (protocol.CreateChannelResponse, error) {
-	var out protocol.CreateChannelResponse
-	err := c.do(ctx, token, "POST", "/v1/channels", protocol.CreateChannelRequest{Label: label}, &out, callTimeout)
+// ClaimName claims a broker-wide name for the session. It returns the name the
+// session holds afterwards.
+func (c *Client) ClaimName(ctx context.Context, token, name string) (protocol.ClaimNameResponse, error) {
+	var out protocol.ClaimNameResponse
+	err := c.do(ctx, token, "POST", "/v1/name", protocol.ClaimNameRequest{Name: name}, &out, callTimeout)
 	return out, err
 }
 
-// JoinChannel joins the channel with the given secret ID under label.
-func (c *Client) JoinChannel(ctx context.Context, token, channelID, label string) (protocol.JoinChannelResponse, error) {
-	var out protocol.JoinChannelResponse
-	err := c.do(ctx, token, "POST", "/v1/channels/join",
-		protocol.JoinChannelRequest{ChannelID: channelID, Label: label}, &out, callTimeout)
+// ReleaseName releases the session's name. Released is "" if it held none.
+func (c *Client) ReleaseName(ctx context.Context, token string) (protocol.ReleaseNameResponse, error) {
+	var out protocol.ReleaseNameResponse
+	err := c.do(ctx, token, "DELETE", "/v1/name", nil, &out, callTimeout)
 	return out, err
 }
 
-// Send sends text to a peer label or handle.
+// Send sends text to the session that holds the name `to`.
 func (c *Client) Send(ctx context.Context, token, to, text string) error {
 	return c.do(ctx, token, "POST", "/v1/messages", protocol.SendRequest{To: to, Text: text}, nil, callTimeout)
-}
-
-// Leave ends the membership named by a peer label or handle.
-func (c *Client) Leave(ctx context.Context, token, to string) error {
-	return c.do(ctx, token, "POST", "/v1/leave", protocol.LeaveRequest{To: to}, nil, callTimeout)
 }
 
 // Sync runs one sync. The HTTP timeout is the wait plus 10 s.

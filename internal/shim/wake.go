@@ -359,12 +359,12 @@ func (w *Wake) reply(c net.Conn, v any) {
 // subscribed reports whether the session wants admin notifications: the
 // broker-confirmed flag or the shim's own intent. The second half keeps a
 // wait started right after admin_subscribe, or during the keeper's
-// re-establishment gap, from getting no_channels (M11).
+// re-establishment gap, from getting no_name (M11).
 func (w *Wake) subscribed(sum Summary) bool { return sum.AdminSubscribed || w.sess.WantAdmin() }
 
 func (w *Wake) status() protocol.StatusReply {
 	sum := w.m.Summary()
-	r := protocol.StatusReply{Count: sum.Count, From: sum.From, LiveChannels: sum.LiveChannels, Armed: w.Armed(), Cursor: sum.Cursor,
+	r := protocol.StatusReply{Count: sum.Count, From: sum.From, Named: sum.Named, Armed: w.Armed(), Cursor: sum.Cursor,
 		Subscribed: w.subscribed(sum)}
 	if r.From == nil {
 		r.From = []string{}
@@ -410,8 +410,8 @@ func (w *Wake) handleWait(c net.Conn, br *bufio.Reader) {
 			}
 			continue // read during the debounce window: stay quiet
 		}
-		if sum.LiveChannels == 0 && !w.subscribed(sum) {
-			w.reply(c, protocol.WaitReply{Status: protocol.WaitNoChannels, Reason: w.noChannelsReason()})
+		if !sum.Named && !w.subscribed(sum) {
+			w.reply(c, protocol.WaitReply{Status: protocol.WaitNoName, Reason: w.noNameReason()})
 			return
 		}
 		select {
@@ -425,12 +425,12 @@ func (w *Wake) handleWait(c net.Conn, br *bufio.Reader) {
 	}
 }
 
-func (w *Wake) noChannelsReason() string {
+// noNameReason explains why there is nothing to wait for: a pending one-time
+// notice (the session was dropped) wins, otherwise the session simply holds no
+// name (it never claimed one, or released it).
+func (w *Wake) noNameReason() string {
 	if n := w.sess.PeekNotice(); n != "" {
 		return n
 	}
-	if w.sess.Token() == "" {
-		return "this session has no agent-bus channels; use create_channel or join_channel first"
-	}
-	return "all of this session's channels have ended (the peer left, the peer's account was removed, or the channel expired)"
+	return "this session holds no agent-bus name; call claim_name first"
 }

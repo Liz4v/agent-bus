@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -45,8 +46,23 @@ const NamePattern = `^[A-Za-z0-9._-]{1,64}$`
 
 var nameRE = regexp.MustCompile(NamePattern)
 
-// ValidName reports whether s is a well-formed account or session name.
+// ValidName reports whether s is a well-formed account name or session name
+// (the name a session claims and peers address it by).
 func ValidName(s string) bool { return nameRE.MatchString(s) }
+
+// NameKey is the case-folded form of a name. Session names are unique by key,
+// so Bob and bob are the same name. The charset is ASCII, so ToLower is exact.
+func NameKey(s string) string { return strings.ToLower(s) }
+
+// ReservedName reports whether a session may not claim s: the system sender
+// and the admin inbox, in any case.
+func ReservedName(s string) bool {
+	switch NameKey(s) {
+	case SystemSender, "admin":
+		return true
+	}
+	return false
+}
 
 // POST /v1/register. ClaimCode is set only by the human claiming or
 // recovering the hostmaster account.

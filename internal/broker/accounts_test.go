@@ -417,8 +417,9 @@ func TestRecoveryReplacesHostmaster(t *testing.T) {
 	old := e.claim("boss")
 	bob := e.active("bob")
 	sBoss, sBob := e.session(old.Credential), e.session(bob.Credential)
-	id, _ := mustCreate(t, e.s, sBoss, "h/boss")
-	mustJoin(t, e.s, sBob, id, "h/bob")
+	claimAs(t, e.s, sBoss, "boss-s")
+	claimAs(t, e.s, sBob, "bob-s")
+	mustSend(t, e.s, sBoss, "bob-s", "hello")
 	e.pending("pend")
 
 	code, mode, err := e.s.IssueClaim(bg)
@@ -436,8 +437,11 @@ func TestRecoveryReplacesHostmaster(t *testing.T) {
 		t.Fatalf("old hostmaster = %s", got)
 	}
 	r := sync0(t, e.s, sBob, protocol.SyncRequest{})
-	if len(r.Messages) == 0 || r.Messages[len(r.Messages)-1].Kind != protocol.KindPeerRemoved || r.Channels[0].State != protocol.StatePeerRemoved {
+	if len(r.Messages) == 0 || r.Messages[len(r.Messages)-1].Kind != protocol.KindPeerRemoved {
 		t.Fatalf("peer of the old hostmaster: %+v", r)
+	}
+	if err := e.s.Send(bg, sBob, "boss-s", "x"); !errors.Is(err, ErrPeerRemoved) {
+		t.Fatalf("send to the removed hostmaster's name: %v", err)
 	}
 	var hosts int
 	e.s.db.QueryRow("SELECT COUNT(*) FROM accounts WHERE is_hostmaster = 1").Scan(&hosts)
@@ -496,7 +500,7 @@ func TestRegistrationPendingOnlyToSubscribedSessions(t *testing.T) {
 	e.pending("newbie")
 	rs := sync0(t, e.s, sub, protocol.SyncRequest{})
 	if len(rs.Messages) != 1 || rs.Messages[0].Kind != protocol.KindRegistrationPending ||
-		rs.Messages[0].Text != "newbie" || rs.Messages[0].Handle != protocol.AdminHandle || rs.Messages[0].FromLabel != nil {
+		rs.Messages[0].Text != "newbie" || rs.Messages[0].From != nil || rs.Messages[0].FromAccount != nil {
 		t.Fatalf("subscribed: %+v", rs.Messages)
 	}
 	if !rs.AdminSubscribed {
@@ -602,22 +606,56 @@ func TestUnknownCredentialAndBadSessionAccount(t *testing.T) {
 	}
 }
 
-func TestRemoveDiscardsOpenChannelAndInbox(t *testing.T) {
+func TestRemoveDiscardsNameAndInbox(t *testing.T) {
 	e := newAcctEnv(t)
 	e.claim("boss")
 	u := e.active("user")
 	su := e.session(u.Credential)
-	_, h := mustCreate(t, e.s, su, "h/user")
-	if err := e.s.Send(bg, su, h, "held text"); err != nil {
-		t.Fatal(err)
-	}
+	claimAs(t, e.s, su, "user-s")
+	other := e.active("other")
+	so := e.session(other.Credential)
+	claimAs(t, e.s, so, "other-s")
+	mustSend(t, e.s, so, "user-s", "queued text")
 	if _, _, err := e.s.Remove(bg, "user"); err != nil {
 		t.Fatal(err)
 	}
-	var channels, held int
-	e.s.db.QueryRow("SELECT COUNT(*) FROM channels").Scan(&channels)
-	e.s.db.QueryRow("SELECT COUNT(*) FROM held").Scan(&held)
-	if channels != 0 || held != 0 {
-		t.Fatalf("channels=%d held=%d left behind", channels, held)
+	var n int
+	e.s.db.QueryRow("SELECT COUNT(*) FROM inbox WHERE session_id = ?", su).Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d inbox rows left behind", n)
 	}
+	e.s.db.QueryRow("SELECT COUNT(*) FROM sessions WHERE name_key = 'user-s'").Scan(&n)
+	if n != 0 {
+		t.Fatal("the removed account's name is still held")
+	}
+	claimAs(t, e.s, e.session(e.active("third").Credential), "user-s")
+}
+
+func TestRemoveTellsPartnersPeerRemovedAndFreesTheirNames(t *testing.T) {
+	e := newAcctEnv(t)
+	e.claim("boss")
+	u1, u2, u3 := e.active("u1"), e.active("u2"), e.active("u3")
+	s1, s2, s3 := e.session(u1.Credential), e.session(u2.Credential), e.session(u3.Credential)
+	claimAs(t, e.s, s1, "u1-s")
+	claimAs(t, e.s, s2, "u2-s")
+	claimAs(t, e.s, s3, "u3-s") // never talks to u1
+	mustSend(t, e.s, s1, "u2-s", "hello")
+	mustSend(t, e.s, s2, "u1-s", "hi")
+	if _, _, err := e.s.Remove(bg, "u1"); err != nil {
+		t.Fatal(err)
+	}
+	got := inboxOf(t, e.s, s2)
+	last := got[len(got)-1]
+	if last.Kind != protocol.KindPeerRemoved || !protocol.IsWaking(last.Kind) || strp(last.From) != "u1-s" || strp(last.FromAccount) != "u1" {
+		t.Fatalf("partner not told: %+v", got)
+	}
+	if got := inboxOf(t, e.s, s3); len(got) != 0 {
+		t.Fatalf("a stranger was told: %+v", got)
+	}
+	if err := e.s.Send(bg, s2, "u1-s", "x"); !errors.Is(err, ErrPeerRemoved) {
+		t.Fatalf("former partner: %v, want ErrPeerRemoved", err)
+	}
+	wantCode(t, e.s.Send(bg, s3, "u1-s", "x"), &Error{Code: protocol.CodeUnknownPeer})
+	// The name is free again.
+	claimAs(t, e.s, e.session(e.active("u4").Credential), "u1-s")
 }

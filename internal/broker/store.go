@@ -20,10 +20,9 @@ import (
 
 // Error is a broker error that maps directly onto an HTTP response.
 type Error struct {
-	Status     int
-	Code       string
-	Message    string
-	KnownPeers []protocol.KnownPeer
+	Status  int
+	Code    string
+	Message string
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
@@ -35,15 +34,22 @@ func newErr(status int, code, msg string) *Error {
 // Errors returned by the store.
 var (
 	ErrUnauthorized = newErr(http.StatusUnauthorized, protocol.CodeUnauthorized, "unknown or expired session")
-	ErrNoOpen       = newErr(http.StatusNotFound, protocol.CodeNoOpenChannel, "no such open channel")
-	ErrBadLabel     = newErr(http.StatusBadRequest, protocol.CodeBadLabel, "label must look like host/name using only letters, digits, '.', '_' and '-'")
-	ErrSameLabel    = newErr(http.StatusBadRequest, protocol.CodeSameLabel, "cannot join a channel under the creator's own label or from the creator's own session")
-	ErrDuplicate    = newErr(http.StatusConflict, protocol.CodeDuplicatePeer, "this session already has a live channel with that peer")
-	ErrPeerLeft     = newErr(http.StatusGone, protocol.CodePeerLeft, "the peer has left this channel")
-	ErrPeerRemoved  = newErr(http.StatusGone, protocol.CodePeerRemoved, "the peer's account was removed by the hostmaster; the channel has ended")
-	ErrExpired      = newErr(http.StatusGone, protocol.CodeChannelExpire, "the channel expired before anyone joined")
-	ErrEmpty        = newErr(http.StatusBadRequest, protocol.CodeEmpty, "message text is empty")
+	ErrBadName      = newErr(http.StatusBadRequest, protocol.CodeBadName, "a name is 1 to 64 characters: letters, digits, '.', '_' and '-' only")
+	ErrReservedName = newErr(http.StatusBadRequest, protocol.CodeBadName, "that name is reserved (agent-bus and admin, in any case); choose another")
+	ErrNameTaken    = newErr(http.StatusConflict, protocol.CodeNameTaken, "that name is already in use by another session")
+	ErrNoName       = newErr(http.StatusConflict, protocol.CodeNoName,
+		"you have not claimed a name: claim one with claim_name first. If this agent-bus has no claim_name tool, it is older than the broker and must be upgraded")
+	ErrSelfSend    = newErr(http.StatusBadRequest, protocol.CodeSelfSend, "you cannot send a message to your own name")
+	ErrPeerLeft    = newErr(http.StatusGone, protocol.CodePeerLeft, "that peer released its name or its session ended; sends to it fail. If someone claims the name later it is a different session")
+	ErrPeerRemoved = newErr(http.StatusGone, protocol.CodePeerRemoved, "that peer's account was removed by the hostmaster; sends to it fail")
+	ErrEmpty       = newErr(http.StatusBadRequest, protocol.CodeEmpty, "message text is empty")
 )
+
+// errNameHeld is the refusal to claim a second, different name.
+func errNameHeld(name string) *Error {
+	return newErr(http.StatusConflict, protocol.CodeNameHeld,
+		"this session already holds the name "+quote(name)+"; release_name first to change it")
+}
 
 func errTooLarge() *Error {
 	return newErr(http.StatusRequestEntityTooLarge, protocol.CodeTooLarge,
@@ -143,6 +149,52 @@ CREATE INDEX members_session ON members(session_id);
 CREATE INDEX held_channel ON held(channel_id);
 `
 
+// schemaV3 is migration 3 (name addressing): channels, members and held
+// messages go away, a session carries its own name, and two small tables
+// replace them. Accounts, retired rows and settings survive; every session and
+// every unread message is discarded. The drop order matters, because foreign
+// keys are enforced.
+const schemaV3 = `
+DROP TABLE IF EXISTS inbox;
+DROP TABLE IF EXISTS held;
+DROP TABLE IF EXISTS members;
+DROP TABLE IF EXISTS channels;
+DROP TABLE IF EXISTS sessions;
+CREATE TABLE sessions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_hash BLOB UNIQUE NOT NULL,
+  account_id INTEGER NOT NULL REFERENCES accounts ON DELETE RESTRICT,
+  created_at INTEGER NOT NULL,
+  disconnected_at INTEGER NULL,
+  version INTEGER NOT NULL DEFAULT 0,
+  admin_sub INTEGER NOT NULL DEFAULT 0,
+  name TEXT NULL,
+  name_key TEXT NULL UNIQUE);
+CREATE INDEX sessions_account ON sessions(account_id);
+CREATE TABLE partners(
+  lo INTEGER NOT NULL REFERENCES sessions ON DELETE CASCADE,
+  hi INTEGER NOT NULL REFERENCES sessions ON DELETE CASCADE,
+  PRIMARY KEY(lo, hi),
+  CHECK (lo < hi));
+CREATE INDEX partners_hi ON partners(hi);
+CREATE TABLE departed(
+  session_id INTEGER NOT NULL REFERENCES sessions ON DELETE CASCADE,
+  name_key TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('peer_left','peer_removed')),
+  PRIMARY KEY(session_id, name_key));
+CREATE INDEX departed_name_key ON departed(name_key);
+CREATE TABLE inbox(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL REFERENCES sessions ON DELETE CASCADE,
+  from_name TEXT NULL,
+  from_account TEXT NULL,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  first_contact INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX inbox_session ON inbox(session_id, id);
+`
+
 // OpenStore opens (and migrates) the database at path. now may be nil.
 func OpenStore(path string, notify *Notify, now Clock) (*Store, error) {
 	if now == nil {
@@ -185,13 +237,18 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	if v >= 2 {
+	if v >= 3 {
 		return nil
 	}
-	if _, err := tx.ExecContext(ctx, schemaV2); err != nil {
-		return fmt.Errorf("migration 2: %w", err)
+	if v < 2 {
+		if _, err := tx.ExecContext(ctx, schemaV2); err != nil {
+			return fmt.Errorf("migration 2: %w", err)
+		}
 	}
-	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+	if _, err := tx.ExecContext(ctx, schemaV3); err != nil {
+		return fmt.Errorf("migration 3: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	return tx.Commit()
@@ -265,93 +322,28 @@ func (tx *Tx) bump(session int64) error {
 func (tx *Tx) wakeOnly(session int64) { tx.bumped[session] = struct{}{} }
 
 // enqueue inserts a row into a session's inbox and bumps its version. from and
-// fromAccount are the sender's label and verified account name (nil for rows
-// with no sender).
-func (tx *Tx) enqueue(session int64, handle string, from, fromAccount *string, kind, text string) error {
+// fromAccount are the sender's name and verified account name (nil for rows
+// with no sender). firstContact marks the first text row from a new sender.
+func (tx *Tx) enqueue(session int64, from, fromAccount *string, kind, text string, firstContact bool) error {
+	fc := 0
+	if firstContact {
+		fc = 1
+	}
 	if _, err := tx.ExecContext(tx.ctx,
-		"INSERT INTO inbox(session_id, handle, from_label, from_account, kind, text, at) VALUES(?,?,?,?,?,?,?)",
-		session, handle, from, fromAccount, kind, text, tx.now); err != nil {
+		"INSERT INTO inbox(session_id, from_name, from_account, kind, text, at, first_contact) VALUES(?,?,?,?,?,?,?)",
+		session, from, fromAccount, kind, text, tx.now, fc); err != nil {
 		return err
 	}
 	return tx.bump(session)
 }
 
-type member struct {
-	id        int64
-	channelID int64
-	sessionID int64
-	label     string
-	handle    string
-	account   string
-}
-
-// removeReason says why a membership ends (M8).
+// removeReason says why a session stops holding its name (M8).
 type removeReason int
 
 const (
-	reasonLeft    removeReason = iota // the member left, or its session was reaped
-	reasonRemoved                     // the member's account was removed by the hostmaster
+	reasonLeft    removeReason = iota // the session released its name, ended, or was reaped
+	reasonRemoved                     // the session's account was removed by the hostmaster
 )
-
-// removeMember is the only code that deletes a membership (I6).
-func (tx *Tx) removeMember(m member, reason removeReason) error {
-	if _, err := tx.ExecContext(tx.ctx, "DELETE FROM members WHERE id = ?", m.id); err != nil {
-		return err
-	}
-	var state string
-	if err := tx.QueryRowContext(tx.ctx, "SELECT state FROM channels WHERE id = ?", m.channelID).Scan(&state); err != nil {
-		return err
-	}
-	var otherSession int64
-	var otherHandle string
-	err := tx.QueryRowContext(tx.ctx, "SELECT session_id, handle FROM members WHERE channel_id = ?", m.channelID).
-		Scan(&otherSession, &otherHandle)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		if _, err := tx.ExecContext(tx.ctx, "DELETE FROM channels WHERE id = ?", m.channelID); err != nil {
-			return err
-		}
-	case err != nil:
-		return err
-	default:
-		if state == "joined" {
-			newState, kind := "ended", protocol.KindPeerLeft
-			if reason == reasonRemoved {
-				newState, kind = "removed", protocol.KindPeerRemoved
-			}
-			if _, err := tx.ExecContext(tx.ctx, "UPDATE channels SET state = ? WHERE id = ?", newState, m.channelID); err != nil {
-				return err
-			}
-			label, account := m.label, m.account
-			if err := tx.enqueue(otherSession, otherHandle, &label, &account, kind, ""); err != nil {
-				return err
-			}
-		}
-		if err := tx.bump(otherSession); err != nil {
-			return err
-		}
-	}
-	return tx.bump(m.sessionID)
-}
-
-// sessionMembers lists a session's memberships, oldest first.
-func (tx *Tx) sessionMembers(session int64) ([]member, error) {
-	rows, err := tx.QueryContext(tx.ctx,
-		"SELECT id, channel_id, session_id, label, handle, account FROM members WHERE session_id = ? ORDER BY id", session)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []member
-	for rows.Next() {
-		var m member
-		if err := rows.Scan(&m.id, &m.channelID, &m.sessionID, &m.label, &m.handle, &m.account); err != nil {
-			return nil, err
-		}
-		out = append(out, m)
-	}
-	return out, rows.Err()
-}
 
 // CreateSession registers a session owned by an active account and returns its
 // token and ID. The account is re-checked inside the transaction, so a
@@ -393,8 +385,8 @@ func (s *Store) SessionByToken(ctx context.Context, token string) (int64, error)
 	return id, err
 }
 
-// DeleteSelf is the clean exit: removeMember for each membership, then delete
-// the session (its inbox goes with it).
+// DeleteSelf is the clean exit: tell the partners, then delete the session
+// (its name, inbox and partner rows go with it).
 func (s *Store) DeleteSelf(ctx context.Context, session int64) error {
 	return s.update(ctx, func(tx *Tx) error {
 		return tx.deleteSession(session, reasonLeft)
@@ -402,14 +394,8 @@ func (s *Store) DeleteSelf(ctx context.Context, session int64) error {
 }
 
 func (tx *Tx) deleteSession(session int64, reason removeReason) error {
-	ms, err := tx.sessionMembers(session)
-	if err != nil {
+	if err := tx.depart(session, reason); err != nil {
 		return err
-	}
-	for _, m := range ms {
-		if err := tx.removeMember(m, reason); err != nil {
-			return err
-		}
 	}
 	if _, err := tx.ExecContext(tx.ctx, "DELETE FROM sessions WHERE id = ?", session); err != nil {
 		return err
@@ -428,21 +414,21 @@ func (s *Store) Sync(ctx context.Context, session int64, req protocol.SyncReques
 				return err
 			}
 		}
-		err := tx.QueryRowContext(ctx, "SELECT version FROM sessions WHERE id = ?", session).Scan(&resp.Version)
+		var adminSub int
+		var name sql.NullString
+		err := tx.QueryRowContext(ctx, "SELECT version, admin_sub, name FROM sessions WHERE id = ?", session).
+			Scan(&resp.Version, &adminSub, &name)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrUnauthorized
 		}
 		if err != nil {
 			return err
 		}
-		var adminSub int
-		if err := tx.QueryRowContext(ctx, "SELECT admin_sub FROM sessions WHERE id = ?", session).Scan(&adminSub); err != nil {
-			return err
-		}
 		resp.AdminSubscribed = adminSub == 1
+		resp.Name = name.String
 		resp.Messages = []protocol.Message{}
 		rows, err := tx.QueryContext(ctx,
-			"SELECT id, handle, from_label, from_account, kind, text, at FROM inbox WHERE session_id = ? AND id > ? ORDER BY id",
+			"SELECT id, from_name, from_account, kind, text, at, first_contact FROM inbox WHERE session_id = ? AND id > ? ORDER BY id",
 			session, req.After)
 		if err != nil {
 			return err
@@ -451,7 +437,8 @@ func (s *Store) Sync(ctx context.Context, session int64, req protocol.SyncReques
 		for rows.Next() {
 			var m protocol.Message
 			var from, fromAccount sql.NullString
-			if err := rows.Scan(&m.ID, &m.Handle, &from, &fromAccount, &m.Kind, &m.Text, &m.At); err != nil {
+			var firstContact int
+			if err := rows.Scan(&m.ID, &from, &fromAccount, &m.Kind, &m.Text, &m.At, &firstContact); err != nil {
 				rows.Close()
 				return err
 			}
@@ -460,9 +447,10 @@ func (s *Store) Sync(ctx context.Context, session int64, req protocol.SyncReques
 				resp.More = true
 				break
 			}
+			m.FirstContact = firstContact == 1
 			if from.Valid {
 				f := from.String
-				m.FromLabel = &f
+				m.From = &f
 			}
 			if fromAccount.Valid {
 				a := fromAccount.String
@@ -473,63 +461,7 @@ func (s *Store) Sync(ctx context.Context, session int64, req protocol.SyncReques
 		}
 		err = rows.Err()
 		rows.Close()
-		if err != nil {
-			return err
-		}
-		resp.Channels, err = tx.channelList(session)
 		return err
 	})
 	return resp, err
-}
-
-// channelList derives each membership's state per the D10 table.
-func (tx *Tx) channelList(session int64) ([]protocol.Channel, error) {
-	rows, err := tx.QueryContext(tx.ctx, `
-SELECT m.handle, m.label, m.peer_label, m.peer_account, c.state, c.created_at, ps.disconnected_at
-FROM members m
-JOIN channels c ON c.id = m.channel_id
-LEFT JOIN members o ON o.channel_id = m.channel_id AND o.id <> m.id
-LEFT JOIN sessions ps ON ps.id = o.session_id
-WHERE m.session_id = ?
-ORDER BY m.id`, session)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []protocol.Channel{}
-	for rows.Next() {
-		var ch protocol.Channel
-		var peer, peerAccount sql.NullString
-		var state string
-		var disc sql.NullInt64
-		if err := rows.Scan(&ch.Handle, &ch.Label, &peer, &peerAccount, &state, &ch.CreatedAt, &disc); err != nil {
-			return nil, err
-		}
-		if peer.Valid {
-			p := peer.String
-			ch.PeerLabel = &p
-		}
-		if peerAccount.Valid {
-			a := peerAccount.String
-			ch.PeerAccount = &a
-		}
-		switch state {
-		case "open":
-			ch.State = protocol.StateWaiting
-		case "joined":
-			if disc.Valid {
-				ch.State = protocol.StatePeerDisconnected
-			} else {
-				ch.State = protocol.StateConnected
-			}
-		case "ended":
-			ch.State = protocol.StatePeerLeft
-		case "expired":
-			ch.State = protocol.StateExpired
-		case "removed":
-			ch.State = protocol.StatePeerRemoved
-		}
-		out = append(out, ch)
-	}
-	return out, rows.Err()
 }

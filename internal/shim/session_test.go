@@ -49,7 +49,7 @@ type testBroker struct {
 	bossCred     string
 	down         atomic.Bool
 	failSessions atomic.Bool  // POST /v1/sessions answers 503 (counted)
-	failChannels atomic.Int32 // number of upcoming /v1/channels requests to drop
+	failName     atomic.Int32 // number of upcoming POST /v1/name requests to drop
 	delay        atomic.Int64 // nanoseconds slept after each /v1/sync is handled, before the handler returns
 
 	clk     *fakeClock
@@ -84,10 +84,10 @@ func newTestBroker(t *testing.T) *testBroker {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if r.URL.Path == "/v1/channels" && tb.failChannels.Add(-1) >= 0 {
+		if r.URL.Path == "/v1/name" && r.Method == "POST" && tb.failName.Add(-1) >= 0 {
 			panic(http.ErrAbortHandler)
-		} else if r.URL.Path == "/v1/channels" {
-			tb.failChannels.Store(0)
+		} else if r.URL.Path == "/v1/name" && r.Method == "POST" {
+			tb.failName.Store(0)
 		}
 		tb.mu.Lock()
 		tb.hits[r.Method+" "+r.URL.Path]++
@@ -206,7 +206,7 @@ func TestConcurrentDropClearsOnceAndSetsNoticeOnce(t *testing.T) {
 	var drops atomic.Int32
 	s.SetCallbacks(nil, func() DropReport {
 		drops.Add(1)
-		return DropReport{HadState: true, UnreadCount: 2, UnreadLabels: []string{"h/a", "h/a"}}
+		return DropReport{HadState: true, Name: "alice", UnreadCount: 2, UnreadLabels: []string{"bob", "bob"}}
 	}, nil)
 	tok, _ := s.Ensure(bg)
 	var wg sync.WaitGroup
@@ -225,8 +225,8 @@ func TestConcurrentDropClearsOnceAndSetsNoticeOnce(t *testing.T) {
 		t.Fatalf("won=%d drops=%d token=%q", won.Load(), drops.Load(), s.Token())
 	}
 	n := s.TakeNotice()
-	if !strings.Contains(n, "expired") || !strings.Contains(n, "2 unread") || !strings.Contains(n, "h/a") ||
-		strings.Count(n, "h/a") != 1 {
+	if !strings.Contains(n, "expired") || !strings.Contains(n, "2 unread") || !strings.Contains(n, "bob") ||
+		strings.Count(n, "bob") != 1 || !strings.Contains(n, "the name alice was released") || !strings.Contains(n, "claim_name") {
 		t.Fatalf("notice: %q", n)
 	}
 	if s.TakeNotice() != "" {
@@ -284,11 +284,13 @@ func TestCloseMakesPeerReadPeerLeftImmediately(t *testing.T) {
 	s := NewSession(tb.c)
 	tokA, _ := s.Ensure(bg)
 	tokB, _, _ := tb.c.CreateSession(bg)
-	ch, err := tb.c.CreateChannel(bg, tokA, "h/a")
-	if err != nil {
+	if _, err := tb.c.ClaimName(bg, tokA, "a"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tb.c.JoinChannel(bg, tokB, ch.ChannelID, "h/b"); err != nil {
+	if _, err := tb.c.ClaimName(bg, tokB, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tb.c.Send(bg, tokA, "b", "hello"); err != nil { // they are partners now
 		t.Fatal(err)
 	}
 	s.Close(bg)
@@ -296,7 +298,7 @@ func TestCloseMakesPeerReadPeerLeftImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(r.Messages) != 1 || r.Messages[0].Kind != protocol.KindPeerLeft || r.Channels[0].State != protocol.StatePeerLeft {
+	if len(r.Messages) != 2 || r.Messages[1].Kind != protocol.KindPeerLeft || r.Messages[1].From == nil || *r.Messages[1].From != "a" {
 		t.Fatalf("peer saw %+v", r)
 	}
 	if s.Token() != "" {
@@ -410,7 +412,7 @@ func TestDropWithNoticeAppends(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tb.c.CreateChannel(bg, tok, "h/me"); err != nil {
+	if _, err := tb.c.ClaimName(bg, tok, "me"); err != nil {
 		t.Fatal(err)
 	}
 	m.Refresh(bg)
@@ -430,12 +432,12 @@ func TestDropWithNoticeAppends(t *testing.T) {
 	}
 	// A normal Drop after a pending notice appends too.
 	tok, _ = s.Ensure(bg)
-	tb.c.CreateChannel(bg, tok, "h/me2")
+	tb.c.ClaimName(bg, tok, "me2")
 	m.Refresh(bg)
 	s.AppendNotice("Pending.")
 	s.Drop(tok)
 	n = s.TakeNotice()
-	if !strings.HasPrefix(n, "Pending.") || !strings.Contains(n, "expired while this host was disconnected") {
+	if !strings.HasPrefix(n, "Pending.") || !strings.Contains(n, "expired while this host was disconnected") || !strings.Contains(n, "the name me2 was released") {
 		t.Fatalf("Drop overwrote the pending notice: %q", n)
 	}
 }

@@ -1,21 +1,12 @@
-// Package secret generates and hashes the bearer secrets (D3).
+// Package secret generates and hashes the bearer secrets (D3): session tokens
+// and account credentials.
 package secret
 
 import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 )
-
-// NewChannelID returns a random UUIDv4 string.
-func NewChannelID() string {
-	var b [16]byte
-	mustRead(b[:])
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
 
 // NewToken returns a session token: 32 random bytes, hex-encoded.
 func NewToken() string {

@@ -55,8 +55,8 @@ func reply(c net.Conn, v any) {
 
 func TestWaitReturnsEachStatus(t *testing.T) {
 	for _, want := range []protocol.WaitReply{
-		{Status: protocol.WaitPending, Count: 2, From: []string{"h/a"}},
-		{Status: protocol.WaitNoChannels, Reason: "none"},
+		{Status: protocol.WaitPending, Count: 2, From: []string{"alice"}},
+		{Status: protocol.WaitNoName, Reason: "none"},
 		{Status: protocol.WaitRearm},
 	} {
 		path := fakeShim(t, func(cmd string, c net.Conn) {
@@ -73,7 +73,7 @@ func TestWaitReturnsEachStatus(t *testing.T) {
 }
 
 func TestStatusRoundTrips(t *testing.T) {
-	want := protocol.StatusReply{Count: 3, From: []string{"h/a", "h/b"}, Cursor: 42}
+	want := protocol.StatusReply{Count: 3, From: []string{"alice", "bob"}, Cursor: 42}
 	path := fakeShim(t, func(cmd string, c net.Conn) {
 		if cmd != protocol.WakeCmdStatus {
 			t.Errorf("command %q", cmd)
@@ -81,7 +81,7 @@ func TestStatusRoundTrips(t *testing.T) {
 		reply(c, want)
 	})
 	got, err := Status(context.Background(), path)
-	if err != nil || got.Count != 3 || got.Cursor != 42 || len(got.From) != 2 || got.From[1] != "h/b" {
+	if err != nil || got.Count != 3 || got.Cursor != 42 || len(got.From) != 2 || got.From[1] != "bob" {
 		t.Fatalf("got %+v, %v", got, err)
 	}
 }

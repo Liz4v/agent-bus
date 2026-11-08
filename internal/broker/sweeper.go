@@ -117,8 +117,7 @@ func (sw *Sweeper) Run(ctx context.Context) {
 }
 
 // Sweep runs one pass: per session reconnect, disconnect, reap (in that
-// order), then the channel TTL expiry, pending-registration expiry and
-// retired-row pruning.
+// order), then pending-registration expiry and retired-row pruning.
 func (sw *Sweeper) Sweep(ctx context.Context) error {
 	type sess struct {
 		id   int64
@@ -145,9 +144,6 @@ func (sw *Sweeper) Sweep(ctx context.Context) error {
 		if err := sw.sweepSession(ctx, s.id, s.disc); err != nil {
 			return err
 		}
-	}
-	if err := sw.expireChannels(ctx); err != nil {
-		return err
 	}
 	if err := sw.store.ExpirePending(ctx); err != nil {
 		return err
@@ -208,8 +204,9 @@ func (sw *Sweeper) sweepSession(ctx context.Context, id int64, disc sql.NullInt6
 }
 
 // setDisconnected flips disconnected_at (to ts, or NULL when ts is nil) guarded
-// by the column's current value, and emits kind to the peer of each joined
-// channel in the same transaction. It reports whether it changed the row.
+// by the column's current value, and emits kind to every partner of the session
+// in the same transaction. It reports whether it changed the row. A session
+// that holds no name has no partners, so nobody is told.
 func (s *Store) setDisconnected(ctx context.Context, id int64, ts *int64, kind string) (bool, error) {
 	changed := false
 	err := s.update(ctx, func(tx *Tx) error {
@@ -228,90 +225,41 @@ func (s *Store) setDisconnected(ctx context.Context, id int64, ts *int64, kind s
 			return nil
 		}
 		changed = true
-		rows, err := tx.QueryContext(ctx, `
-SELECT o.session_id, o.handle, m.label, m.account
-FROM members m
-JOIN channels c ON c.id = m.channel_id AND c.state = 'joined'
-JOIN members o ON o.channel_id = m.channel_id AND o.id <> m.id
-WHERE m.session_id = ? ORDER BY m.id`, id)
+		var name sql.NullString
+		var account string
+		err = tx.QueryRowContext(ctx, `
+SELECT s.name, a.name FROM sessions s JOIN accounts a ON a.id = s.account_id WHERE s.id = ?`, id).Scan(&name, &account)
+		if err == sql.ErrNoRows || (err == nil && !name.Valid) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
-		type target struct {
-			session                int64
-			handle, label, account string
+		rows, err := tx.QueryContext(ctx,
+			"SELECT CASE WHEN lo = ? THEN hi ELSE lo END AS other FROM partners WHERE lo = ? OR hi = ? ORDER BY other", id, id, id)
+		if err != nil {
+			return err
 		}
-		var targets []target
+		var targets []int64
 		for rows.Next() {
-			var t target
-			if err := rows.Scan(&t.session, &t.handle, &t.label, &t.account); err != nil {
+			var o int64
+			if err := rows.Scan(&o); err != nil {
 				rows.Close()
 				return err
 			}
-			targets = append(targets, t)
+			targets = append(targets, o)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		for _, t := range targets {
-			label, account := t.label, t.account
-			if err := tx.enqueue(t.session, t.handle, &label, &account, kind, ""); err != nil {
+		for _, o := range targets {
+			from, fromAccount := name.String, account
+			if err := tx.enqueue(o, &from, &fromAccount, kind, "", false); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
 	return changed, err
-}
-
-// expireChannels moves open channels older than the TTL to expired, deletes
-// their held rows and tells the creator. The creator's membership stays.
-func (sw *Sweeper) expireChannels(ctx context.Context) error {
-	return sw.store.expireChannels(ctx)
-}
-
-func (s *Store) expireChannels(ctx context.Context) error {
-	cutoff := s.now().Add(-protocol.ChannelTTL).Unix()
-	rows, err := s.db.QueryContext(ctx, "SELECT id FROM channels WHERE state = 'open' AND created_at < ? ORDER BY id", cutoff)
-	if err != nil {
-		return err
-	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, cid := range ids {
-		err := s.update(ctx, func(tx *Tx) error {
-			res, err := tx.ExecContext(ctx, "UPDATE channels SET state = 'expired' WHERE id = ? AND state = 'open'", cid)
-			if err != nil {
-				return err
-			}
-			if n, _ := res.RowsAffected(); n == 0 {
-				return nil
-			}
-			if _, err := tx.ExecContext(ctx, "DELETE FROM held WHERE channel_id = ?", cid); err != nil {
-				return err
-			}
-			var sess int64
-			var handle string
-			if err := tx.QueryRowContext(ctx, "SELECT session_id, handle FROM members WHERE channel_id = ?", cid).Scan(&sess, &handle); err != nil {
-				return err
-			}
-			return tx.enqueue(sess, handle, nil, nil, protocol.KindChannelExpired, "")
-		})
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }

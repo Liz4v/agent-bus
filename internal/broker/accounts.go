@@ -210,7 +210,7 @@ func (tx *Tx) notifyAdmins(name string) error {
 		return err
 	}
 	for _, id := range ids {
-		if err := tx.enqueue(id, protocol.AdminHandle, nil, nil, protocol.KindRegistrationPending, name); err != nil {
+		if err := tx.enqueue(id, nil, nil, protocol.KindRegistrationPending, name, false); err != nil {
 			return err
 		}
 	}
@@ -227,8 +227,9 @@ func (tx *Tx) hasHostmaster() (bool, error) {
 }
 
 // deleteAccount removes an account row, deleting its sessions through the
-// removal path (M8) and leaving a retired row keyed by its credential hash. It
-// returns the IDs of the deleted sessions.
+// removal path (M8) and leaving a retired row keyed by its credential hash. Each
+// session's name is released and its conversation partners get peer_removed in
+// the same transaction. It returns the IDs of the deleted sessions.
 func (tx *Tx) deleteAccount(id int64, outcome string) ([]int64, error) {
 	var name string
 	var credHash []byte

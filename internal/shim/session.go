@@ -49,20 +49,22 @@ func (e *AccountError) Error() string {
 func accountGoneNotice(status string) string {
 	switch status {
 	case protocol.AccountRejected:
-		return "Your agent-bus account was rejected by the hostmaster, so your channels are gone."
+		return "Your agent-bus account was rejected by the hostmaster, so your name was released."
 	case protocol.AccountExpired:
-		return "Your agent-bus registration expired, so your channels are gone."
+		return "Your agent-bus registration expired, so your name was released."
 	case protocol.AccountRemoved:
-		return "Your agent-bus account was removed by the hostmaster, so your channels are gone. Tell the user; do not investigate."
+		return "Your agent-bus account was removed by the hostmaster, so your name was released. Tell the user; do not investigate."
 	default:
-		return "Your agent-bus account is no longer active (" + status + "), so your channels are gone. Tell the user."
+		return "Your agent-bus account is no longer active (" + status + "), so your name was released. Tell the user."
 	}
 }
 
 // DropReport is what the mirror tells the session when it is emptied by a drop.
 type DropReport struct {
-	// HadState is true if the mirror held channels or unread rows.
+	// HadState is true if the mirror held a name or unread rows.
 	HadState bool
+	// Name is the name the session held, "" if none.
+	Name string
 	// UnreadCount and UnreadLabels describe the unread waking rows discarded
 	// (counts and sender labels only, never content).
 	UnreadCount  int
@@ -192,7 +194,7 @@ func (s *Session) DropAfter401(ctx context.Context, token string) bool {
 	case err == nil && st.Status != protocol.AccountActive:
 		return s.DropWithNotice(token, accountGoneNotice(st.Status))
 	case errors.As(err, &ae) && ae.Status == 401:
-		return s.DropWithNotice(token, "The broker no longer recognises this account's credential, so your channels are gone. Tell the user; a person must run `agent-bus status`.")
+		return s.DropWithNotice(token, "The broker no longer recognises this account's credential, so your name was released. Tell the user; a person must run `agent-bus status`.")
 	}
 	return s.Drop(token)
 }
@@ -240,7 +242,11 @@ func (s *Session) AppendNotice(text string) {
 }
 
 func dropNotice(rep DropReport) string {
-	msg := "Your agent-bus memberships expired while this host was disconnected; ask the human for a new channel ID."
+	msg := "Your agent-bus session expired while this host was disconnected."
+	if rep.Name != "" {
+		msg = "Your agent-bus session expired while this host was disconnected, so the name " + rep.Name +
+			" was released and your partners were told. Claim it again with claim_name if the user still wants it."
+	}
 	if rep.UnreadCount > 0 {
 		labels := dedupe(rep.UnreadLabels)
 		msg += fmt.Sprintf(" %d unread message(s)/event(s) from %s were discarded.", rep.UnreadCount, strings.Join(labels, ", "))

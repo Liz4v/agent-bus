@@ -121,10 +121,12 @@ func (e *wakeEnv) commitAll() {
 
 func TestWaitPendingImmediatelyWhenUnreadExists(t *testing.T) {
 	e := newWakeEnv(t, WakeOptions{})
-	e.link() // the creator has an unread peer_joined
+	e.link()
+	e.peerSend("hi")
+	e.eventually(func(s Snapshot) bool { return len(s.Rows) > 0 })
 	start := time.Now()
 	r := waitReply(t, e.w.Path(), 3*time.Second)
-	if r.Status != protocol.WaitPending || r.Count < 1 || len(r.From) != 1 || r.From[0] != "h/peer" {
+	if r.Status != protocol.WaitPending || r.Count < 1 || len(r.From) != 1 || r.From[0] != "peer" {
 		t.Fatalf("reply: %+v", r)
 	}
 	if time.Since(start) > 2*time.Second {
@@ -182,38 +184,88 @@ func TestInformationalEventsNeverWake(t *testing.T) {
 	e.tb.sweeper.Sweep(bg)
 	e.eventually(func(s Snapshot) bool { return rowsWithKind(s, protocol.KindPeerReconnected) == 1 })
 	noReply(t, c, br, 600*time.Millisecond)
-	if st := statusOf(t, e.w.Path()); st.Count != 0 || st.LiveChannels != 1 {
+	if st := statusOf(t, e.w.Path()); st.Count != 0 || !st.Named {
 		t.Fatalf("status: %+v", st)
 	}
 }
 
-func TestLastChannelEndedThenNoChannelsAfterRead(t *testing.T) {
+func TestPeerReleaseWakesAndTheWaitStaysArmedAfterRead(t *testing.T) {
 	e := newWakeEnv(t, WakeOptions{})
 	e.link()
 	e.commitAll()
-	if err := e.tb.c.Leave(bg, e.peerTok, "h/me"); err != nil {
+	if _, err := e.tb.c.ReleaseName(bg, e.peerTok); err != nil {
 		t.Fatal(err)
 	}
 	e.eventually(func(s Snapshot) bool { return rowsWithKind(s, protocol.KindPeerLeft) == 1 })
 	r := waitReply(t, e.w.Path(), 3*time.Second)
-	if r.Status != protocol.WaitPending || len(r.From) != 1 || r.From[0] != "h/peer" {
+	if r.Status != protocol.WaitPending || len(r.From) != 1 || r.From[0] != "peer" {
 		t.Fatalf("reply: %+v", r)
 	}
 	e.commitAll()
-	r = waitReply(t, e.w.Path(), 3*time.Second)
-	if r.Status != protocol.WaitNoChannels || r.Reason == "" {
+	// The session still holds its own name, so there is still something to
+	// wait for: another peer may write to it.
+	c, br := dial(t, e.w.Path(), "WAIT")
+	noReply(t, c, br, 500*time.Millisecond)
+	if !e.w.Armed() {
+		t.Fatal("the wait should still be armed")
+	}
+}
+
+func TestOwnReleaseWhileArmedGetsNoName(t *testing.T) {
+	e := newWakeEnv(t, WakeOptions{})
+	e.link()
+	e.commitAll()
+	c, br := dial(t, e.w.Path(), "WAIT")
+	noReply(t, c, br, 300*time.Millisecond)
+	if _, err := e.tb.c.ReleaseName(bg, e.sess.Token()); err != nil {
+		t.Fatal(err)
+	}
+	e.m.DiscardPeerRows()
+	e.m.Refresh(bg)
+	line, err := readLine(c, br, 3*time.Second)
+	if err != nil {
+		t.Fatalf("the armed wait was not told: %v", err)
+	}
+	var r protocol.WaitReply
+	json.Unmarshal([]byte(line), &r)
+	if r.Status != protocol.WaitNoName || !strings.Contains(r.Reason, "claim_name") {
+		t.Fatalf("reply: %+v", r)
+	}
+	// A new WAIT gets the same answer at once.
+	if r := waitReply(t, e.w.Path(), 3*time.Second); r.Status != protocol.WaitNoName {
+		t.Fatalf("new wait: %+v", r)
+	}
+	if st := statusOf(t, e.w.Path()); st.Named {
+		t.Fatalf("status still named: %+v", st)
+	}
+}
+
+func TestWaitWithANameStaysArmedUntilAWakingRowArrives(t *testing.T) {
+	e := newWakeEnv(t, WakeOptions{})
+	e.link()
+	e.commitAll()
+	c, br := dial(t, e.w.Path(), "WAIT")
+	noReply(t, c, br, 400*time.Millisecond)
+	e.peerSend("now")
+	line, err := readLine(c, br, 3*time.Second)
+	if err != nil {
+		t.Fatalf("not woken by a message: %v", err)
+	}
+	var r protocol.WaitReply
+	json.Unmarshal([]byte(line), &r)
+	if r.Status != protocol.WaitPending || r.Count != 1 || r.From[0] != "peer" {
 		t.Fatalf("reply: %+v", r)
 	}
 }
 
-func TestUnregisteredShimNoChannelsAtOnce(t *testing.T) {
+func TestUnregisteredShimNoNameAtOnce(t *testing.T) {
 	e := newWakeEnv(t, WakeOptions{})
 	r := waitReply(t, e.w.Path(), time.Second)
-	if r.Status != protocol.WaitNoChannels || r.Reason == "" {
+	if r.Status != protocol.WaitNoName || r.Reason == "" {
 		t.Fatalf("reply: %+v", r)
 	}
 	st := statusOf(t, e.w.Path())
-	if st.Count != 0 || st.LiveChannels != 0 || st.Armed || st.Error != nil || len(st.From) != 0 {
+	if st.Count != 0 || st.Named || st.Armed || st.Error != nil || len(st.From) != 0 {
 		t.Fatalf("status: %+v", st)
 	}
 	if e.tb.totalHits() != 0 {
@@ -235,7 +287,7 @@ func TestWaitWhenSessionDroppedGetsNoticeReason(t *testing.T) {
 	}
 	var r protocol.WaitReply
 	json.Unmarshal([]byte(line), &r)
-	if r.Status != protocol.WaitNoChannels || r.Reason == "" || time.Since(start) > 4*time.Second {
+	if r.Status != protocol.WaitNoName || r.Reason == "" || time.Since(start) > 4*time.Second {
 		t.Fatalf("reply %+v after %v", r, time.Since(start))
 	}
 	if e.sess.PeekNotice() != r.Reason {
@@ -246,17 +298,13 @@ func TestWaitWhenSessionDroppedGetsNoticeReason(t *testing.T) {
 	}
 }
 
-func TestExpiredChannelReportedFromAgentBus(t *testing.T) {
+func TestSessionWithATokenButNoNameGetsNoName(t *testing.T) {
 	e := newWakeEnv(t, WakeOptions{})
-	tok, _ := e.sess.Ensure(bg)
-	if _, err := e.tb.c.CreateChannel(bg, tok, "h/me"); err != nil {
+	if _, err := e.sess.Ensure(bg); err != nil {
 		t.Fatal(err)
 	}
-	e.tb.clk.Advance(protocol.ChannelTTL + time.Second)
-	e.m.Refresh(bg)
-	e.tb.sweeper.Sweep(bg)
 	r := waitReply(t, e.w.Path(), 3*time.Second)
-	if r.Status != protocol.WaitPending || len(r.From) != 1 || r.From[0] != protocol.SystemSender {
+	if r.Status != protocol.WaitNoName || !strings.Contains(r.Reason, "claim_name") {
 		t.Fatalf("reply: %+v", r)
 	}
 }
@@ -291,6 +339,8 @@ func TestUntrustedSocketDirectoryRefused(t *testing.T) {
 func TestTwoConcurrentWaitsGetTheSameReply(t *testing.T) {
 	e := newWakeEnv(t, WakeOptions{})
 	e.link()
+	e.peerSend("hi")
+	e.eventually(func(s Snapshot) bool { return len(s.Rows) > 0 })
 	c1, b1 := dial(t, e.w.Path(), "WAIT")
 	c2, b2 := dial(t, e.w.Path(), "WAIT")
 	l1, err1 := readLine(c1, b1, 3*time.Second)
@@ -337,7 +387,7 @@ func TestStatusErrorWhileBrokerDown(t *testing.T) {
 	e.tb.down.Store(true)
 	e.m.Refresh(bg)
 	st := statusOf(t, e.w.Path())
-	if st.Error == nil || st.LiveChannels != 1 {
+	if st.Error == nil || !st.Named {
 		t.Fatalf("status: %+v", st)
 	}
 	e.tb.down.Store(false)
@@ -442,7 +492,7 @@ func TestWaitStaysArmedByDefault(t *testing.T) {
 	}
 }
 
-func TestSubscribedSessionWithNoChannelsStaysArmedAndWakesOnRegistration(t *testing.T) {
+func TestSubscribedSessionWithNoNameStaysArmedAndWakesOnRegistration(t *testing.T) {
 	e := newHostmasterWakeEnv(t, WakeOptions{})
 	tok, err := e.sess.Ensure(bg)
 	if err != nil {
@@ -452,11 +502,11 @@ func TestSubscribedSessionWithNoChannelsStaysArmedAndWakesOnRegistration(t *test
 		t.Fatal(err)
 	}
 	e.eventually(func(s Snapshot) bool { return s.AdminSubscribed })
-	if st := statusOf(t, e.w.Path()); !st.Subscribed || st.LiveChannels != 0 {
+	if st := statusOf(t, e.w.Path()); !st.Subscribed || st.Named {
 		t.Fatalf("status: %+v", st)
 	}
 	c, br := dial(t, e.w.Path(), "WAIT")
-	noReply(t, c, br, 400*time.Millisecond) // no channels, but subscribed: still armed
+	noReply(t, c, br, 400*time.Millisecond) // no name, but subscribed: still armed
 	if _, err := e.tb.store.Register(bg, "newbie", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -478,7 +528,7 @@ func TestWaitDuringKeeperGapStaysArmedUntilIntentCleared(t *testing.T) {
 	e.sess.Drop(tok) // the mirror is now reset to empty; the keeper is "re-establishing"
 
 	c, br := dial(t, e.w.Path(), "WAIT")
-	noReply(t, c, br, 400*time.Millisecond) // wantAdmin keeps it armed: no no_channels
+	noReply(t, c, br, 400*time.Millisecond) // wantAdmin keeps it armed: no no_name
 	if st := statusOf(t, e.w.Path()); !st.Subscribed || !st.Armed {
 		t.Fatalf("status: %+v", st)
 	}
@@ -493,19 +543,19 @@ func TestWaitDuringKeeperGapStaysArmedUntilIntentCleared(t *testing.T) {
 	}
 	var r protocol.WaitReply
 	json.Unmarshal([]byte(line), &r)
-	if r.Status != protocol.WaitNoChannels || !strings.Contains(r.Reason, "could not be restored") {
+	if r.Status != protocol.WaitNoName || !strings.Contains(r.Reason, "could not be restored") {
 		t.Fatalf("reply %+v", r)
 	}
-	// A new WAIT now gets no_channels at once.
-	if r := waitReply(t, e.w.Path(), 3*time.Second); r.Status != protocol.WaitNoChannels {
+	// A new WAIT now gets no_name at once.
+	if r := waitReply(t, e.w.Path(), 3*time.Second); r.Status != protocol.WaitNoName {
 		t.Fatalf("after clearing: %+v", r)
 	}
 }
 
-func TestUnsubscribedNoChannelsStillReplyNoChannels(t *testing.T) {
+func TestUnsubscribedNoNameStillReplyNoName(t *testing.T) {
 	e := newHostmasterWakeEnv(t, WakeOptions{})
 	e.sess.Ensure(bg)
-	if r := waitReply(t, e.w.Path(), 3*time.Second); r.Status != protocol.WaitNoChannels {
+	if r := waitReply(t, e.w.Path(), 3*time.Second); r.Status != protocol.WaitNoName {
 		t.Fatalf("%+v", r)
 	}
 	if st := statusOf(t, e.w.Path()); st.Subscribed {

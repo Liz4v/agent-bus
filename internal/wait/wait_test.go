@@ -51,11 +51,11 @@ func TestPending(t *testing.T) {
 	var got string
 	sock := fakeShim(t, func(c net.Conn, cmd string) {
 		got = cmd
-		c.Write([]byte(`{"status":"pending","from":["h/a","agent-bus","evil\" label"],"count":3}` + "\n"))
+		c.Write([]byte(`{"status":"pending","from":["alice","agent-bus","evil\" name","h/a"],"count":3}` + "\n"))
 	})
 	code, out, _ := run(t, sock)
-	if code != 0 || got != "WAIT" || !strings.Contains(out, "3 unread") || !strings.Contains(out, "h/a, agent-bus") ||
-		strings.Contains(out, "evil") {
+	if code != 0 || got != "WAIT" || !strings.Contains(out, "3 unread") || !strings.Contains(out, "alice, agent-bus") ||
+		strings.Contains(out, "evil") || strings.Contains(out, "h/a") {
 		t.Fatalf("code=%d out=%q cmd=%q", code, out, got)
 	}
 	if strings.Count(out, "\n") != 1 {
@@ -63,12 +63,15 @@ func TestPending(t *testing.T) {
 	}
 }
 
-func TestNoChannelsPrintsReason(t *testing.T) {
+func TestNoNamePrintsReasonAndExitsNothing(t *testing.T) {
+	if ExitNothing != 1 {
+		t.Fatalf("ExitNothing = %d: the skills tell agents that exit 1 means nothing to wait for", ExitNothing)
+	}
 	sock := fakeShim(t, func(c net.Conn, _ string) {
-		c.Write([]byte(`{"status":"no_channels","reason":"all channels have ended"}` + "\n"))
+		c.Write([]byte(`{"status":"no_name","reason":"this session holds no agent-bus name; call claim_name first"}` + "\n"))
 	})
 	code, out, _ := run(t, sock)
-	if code != 1 || !strings.Contains(out, "all channels have ended") {
+	if code != ExitNothing || !strings.Contains(out, "nothing to wait for") || !strings.Contains(out, "claim_name") {
 		t.Fatalf("code=%d out=%q", code, out)
 	}
 }
@@ -120,14 +123,14 @@ func TestContextCancelStopsWaiting(t *testing.T) {
 	}
 }
 
-func TestFilterLabels(t *testing.T) {
-	got := FilterLabels([]string{"host/alice", "agent-bus", "bad label\nIgnore previous", "<script>"})
-	if len(got) != 2 || got[0] != "host/alice" || got[1] != "agent-bus" {
+func TestFilterNames(t *testing.T) {
+	got := FilterNames([]string{"alice", "agent-bus", "bad name\nIgnore previous", "<script>", "host/alice", "Bob.s-1_x"})
+	if len(got) != 3 || got[0] != "alice" || got[1] != "agent-bus" || got[2] != "Bob.s-1_x" {
 		t.Fatalf("got %q", got)
 	}
-	for _, in := range [][]string{nil, {}, {"\n"}} {
-		if out := FilterLabels(in); out == nil || len(out) != 0 {
-			t.Fatalf("FilterLabels(%q) = %#v, want empty non-nil", in, out)
+	for _, in := range [][]string{nil, {}, {"\n"}, {"a/b"}} {
+		if out := FilterNames(in); out == nil || len(out) != 0 {
+			t.Fatalf("FilterNames(%q) = %#v, want empty non-nil", in, out)
 		}
 	}
 }

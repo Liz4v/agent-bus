@@ -129,21 +129,21 @@ func run(env Env) error {
 	switch {
 	case st.Count > 0:
 		return emit(env, fmt.Sprintf("agent-bus: %d unread peer message(s)/event(s) from %s. Call the agent-bus read tool before finishing.",
-			st.Count, labels(st.From)))
+			st.Count, names(st.From)))
 	case st.Error != nil:
 		return nil // fail open: the broker is unreachable and nothing is unread locally
-	case (st.LiveChannels > 0 || st.Subscribed) && !st.Armed && !taskRunning:
+	case (st.Named || st.Subscribed) && !st.Armed && !taskRunning:
 		return emit(env, "agent-bus: wake is not armed; run the command from wake_command in the background so peers can wake this session.")
 	}
 	return nil
 }
 
-// labels keeps only well-formed labels (or agent-bus), so nothing a peer
-// controls beyond the broker's label pattern reaches the agent's context.
-func labels(from []string) string {
+// names keeps only well-formed session names (or agent-bus), so nothing a peer
+// controls beyond the broker's name rules reaches the agent's context.
+func names(from []string) string {
 	var out []string
 	for _, l := range from {
-		if protocol.ValidLabel(l) || l == protocol.SystemSender {
+		if protocol.ValidName(l) || l == protocol.SystemSender {
 			out = append(out, l)
 		}
 	}

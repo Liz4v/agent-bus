@@ -14,7 +14,7 @@ import (
 // hostmasterShim is the hostmaster's shim with the hint set.
 func hostmasterShim(t *testing.T, tb *testBroker) *shimEnv {
 	t.Helper()
-	return newShimWith(t, tb, "hostA", tb.newClient(tb.bossCred), nil, true)
+	return newShimWith(t, tb, tb.newClient(tb.bossCred), nil, true)
 }
 
 func startWakeFor(t *testing.T, e *shimEnv) *Wake {
@@ -106,7 +106,7 @@ func TestAdminToolDescriptionsCarryTheRules(t *testing.T) {
 
 func TestNonHostmasterWithTheHintGetsForbiddenRendered(t *testing.T) {
 	tb := newTestBroker(t)
-	e := newShimWith(t, tb, "hostA", tb.c, nil, true) // the hint is stale or wrong
+	e := newShimWith(t, tb, tb.c, nil, true) // the hint is stale or wrong
 	for name, args := range map[string]map[string]any{
 		"admin_list_accounts": nil, "admin_approve": {"name": "x"}, "admin_reject": {"name": "x"},
 		"admin_remove": {"name": "x"}, "admin_set_max_accounts": {"max": 3}, "admin_subscribe": {"subscribed": true},
@@ -150,7 +150,7 @@ func TestSubscribeThenImmediateWaitStaysArmed(t *testing.T) {
 	if !strings.Contains(out, "Subscribed") {
 		t.Fatal(out)
 	}
-	// Right away, with no channels and before the next long-poll: armed.
+	// Right away, with no name and before the next long-poll: armed.
 	c, br := dial(t, w.Path(), "WAIT")
 	noReply(t, c, br, 400*time.Millisecond)
 	if !e.m.Summary().AdminSubscribed {
@@ -171,7 +171,7 @@ func TestSubscribeThenImmediateWaitStaysArmed(t *testing.T) {
 	c2, br2 := dial(t, w.Path(), "WAIT")
 	noReply(t, c2, br2, 300*time.Millisecond)
 	e.mustOK("admin_subscribe", map[string]any{"subscribed": false})
-	if line, err := readLine(c2, br2, 3*time.Second); err != nil || !strings.Contains(line, "no_channels") {
+	if line, err := readLine(c2, br2, 3*time.Second); err != nil || !strings.Contains(line, "no_name") {
 		t.Fatalf("armed wait not released by unsubscribe: %q %v", line, err)
 	}
 }
@@ -188,23 +188,24 @@ func TestKeeperResubscribesAfterForcedDrop(t *testing.T) {
 	if n := tb.hitCount("POST /v1/admin/subscribe"); n != 2 {
 		t.Fatalf("subscribe called %d times, want 2", n)
 	}
-	// The drop had no channels, so there is no notice; a registration still arrives.
+	// The drop held no name, so there is no notice; a registration still arrives.
 	if _, err := tb.store.Register(bg, "newbie", ""); err != nil {
 		t.Fatal(err)
 	}
 	e.eventually(func(s Snapshot) bool { return len(s.Rows) > 0 })
 }
 
-func TestKeeperNoticeSaysRestoredWhenChannelsWereLost(t *testing.T) {
+func TestKeeperNoticeSaysRestoredWhenANameWasLost(t *testing.T) {
 	tb := newTestBroker(t)
 	e := hostmasterShim(t, tb)
-	e.mustOK("create_channel", map[string]any{"my_name": "boss"})
+	e.mustOK("claim_name", map[string]any{"name": "boss-s"})
 	e.mustOK("admin_subscribe", map[string]any{"subscribed": true})
 	tok := e.sess.Token()
 	tb.kill(tok)
 	eventually(t, "restore", 10*time.Second, func() bool { return e.sess.Token() != "" && e.sess.Token() != tok && e.m.Summary().AdminSubscribed })
 	n := e.sess.PeekNotice()
-	if !strings.Contains(n, "expired while this host was disconnected") || !strings.Contains(n, "admin subscription was restored") {
+	if !strings.Contains(n, "expired while this host was disconnected") || !strings.Contains(n, "the name boss-s was released") ||
+		!strings.Contains(n, "admin subscription was restored") {
 		t.Fatalf("notice: %q", n)
 	}
 }
@@ -258,7 +259,7 @@ func TestKeeperStopsWhenAccountRemovedAndWakesArmedWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	line, err := readLine(c, br, 10*time.Second)
-	if err != nil || !strings.Contains(line, "no_channels") || !strings.Contains(line, "could not be restored") {
+	if err != nil || !strings.Contains(line, "no_name") || !strings.Contains(line, "could not be restored") {
 		t.Fatalf("armed wait not released: %q %v", line, err)
 	}
 	if e.sess.WantAdmin() {
@@ -328,7 +329,7 @@ func newScriptedAdmin(t *testing.T) (*scriptedAdmin, *client.Client) {
 func TestKeeperStopsOnForbiddenSubscribe(t *testing.T) {
 	sa, c := newScriptedAdmin(t)
 	tb := newTestBroker(t)
-	e := newShimWith(t, tb, "hostA", c, nil, true)
+	e := newShimWith(t, tb, c, nil, true)
 	w := startWakeFor(t, e)
 	e.mustOK("admin_subscribe", map[string]any{"subscribed": true})
 	cn, br := dial(t, w.Path(), "WAIT")
@@ -336,7 +337,7 @@ func TestKeeperStopsOnForbiddenSubscribe(t *testing.T) {
 	sa.subscribeStatus.Store(403)
 	e.sess.Drop(e.sess.Token())
 	line, err := readLine(cn, br, 10*time.Second)
-	if err != nil || !strings.Contains(line, "no_channels") {
+	if err != nil || !strings.Contains(line, "no_name") {
 		t.Fatalf("armed wait not released: %q %v", line, err)
 	}
 	if e.sess.WantAdmin() || !strings.Contains(e.sess.PeekNotice(), "no longer the hostmaster") {
@@ -352,7 +353,7 @@ func TestKeeperStopsOnForbiddenSubscribe(t *testing.T) {
 func TestKeeperStopsOnCredentialUnknownAtSessionCreation(t *testing.T) {
 	sa, c := newScriptedAdmin(t)
 	tb := newTestBroker(t)
-	e := newShimWith(t, tb, "hostA", c, nil, true)
+	e := newShimWith(t, tb, c, nil, true)
 	w := startWakeFor(t, e)
 	e.mustOK("admin_subscribe", map[string]any{"subscribed": true})
 	cn, br := dial(t, w.Path(), "WAIT")
@@ -360,7 +361,7 @@ func TestKeeperStopsOnCredentialUnknownAtSessionCreation(t *testing.T) {
 	sa.sessionStatus.Store(401)
 	e.sess.Drop(e.sess.Token())
 	line, err := readLine(cn, br, 10*time.Second)
-	if err != nil || !strings.Contains(line, "no_channels") {
+	if err != nil || !strings.Contains(line, "no_name") {
 		t.Fatalf("armed wait not released: %q %v", line, err)
 	}
 	if e.sess.WantAdmin() || !strings.Contains(e.sess.PeekNotice(), "does not recognise") {
@@ -391,4 +392,33 @@ func TestKeeperBacksOffAndDoesNotLoopHot(t *testing.T) {
 	}
 	tb.failSessions.Store(false)
 	eventually(t, "recovery", 10*time.Second, func() bool { return e.sess.Token() != "" && e.m.Summary().AdminSubscribed })
+}
+
+func TestSubscribedSessionWithNoNameIsStillWokenByARegistration(t *testing.T) {
+	tb := newTestBroker(t)
+	e := hostmasterShim(t, tb)
+	w := startWakeFor(t, e)
+	e.mustOK("admin_subscribe", map[string]any{"subscribed": true})
+	if e.m.Snapshot().Name != "" {
+		t.Fatal("setup: the hostmaster session must hold no name")
+	}
+	c, br := dial(t, w.Path(), "WAIT")
+	noReply(t, c, br, 300*time.Millisecond) // no name, but subscribed: armed
+	if _, err := tb.store.Register(bg, "newbie", ""); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := readLine(c, br, 3*time.Second); err != nil || !strings.Contains(line, `"pending"`) {
+		t.Fatalf("not woken without a name: %q %v", line, err)
+	}
+	// It cannot send peer messages until it claims a name.
+	if text, isErr := e.call("send", map[string]any{"peer": "bob", "text": "x"}); !isErr || !strings.Contains(text, "claim_name") {
+		t.Fatalf("send without a name: err=%v %s", isErr, text)
+	}
+	// Releasing a name it never had keeps the admin row.
+	if text := e.mustOK("release_name", nil); !strings.Contains(text, "You hold no name") {
+		t.Fatalf("release: %s", text)
+	}
+	if got := e.mustOK("read", nil); !strings.Contains(got, "newbie") {
+		t.Fatalf("the admin row was lost: %s", got)
+	}
 }

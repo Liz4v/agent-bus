@@ -10,12 +10,12 @@ import (
 
 // Default durations (Architect: sidecar state machine).
 const (
-	DefaultPoll            = 5 * time.Second
-	DefaultStuck           = 10 * time.Minute
-	DefaultMinSpacing      = 10 * time.Second
-	DefaultNoChannelsSleep = 10 * time.Second
-	DefaultBackoffMin      = time.Second
-	DefaultBackoffMax      = 60 * time.Second
+	DefaultPoll        = 5 * time.Second
+	DefaultStuck       = 10 * time.Minute
+	DefaultMinSpacing  = 10 * time.Second
+	DefaultNoNameSleep = 10 * time.Second
+	DefaultBackoffMin  = time.Second
+	DefaultBackoffMax  = 60 * time.Second
 )
 
 // Shim is the wake-socket client.
@@ -42,12 +42,12 @@ type Config struct {
 	Clock    Clock // nil means the real clock
 	Log      *slog.Logger
 
-	Poll            time.Duration // HOLD STATUS poll interval
-	Stuck           time.Duration // HOLD re-fire when count stays above zero
-	MinSpacing      time.Duration // minimum between two accepted POSTs
-	NoChannelsSleep time.Duration
-	BackoffMin      time.Duration
-	BackoffMax      time.Duration
+	Poll        time.Duration // HOLD STATUS poll interval
+	Stuck       time.Duration // HOLD re-fire when count stays above zero
+	MinSpacing  time.Duration // minimum between two accepted POSTs
+	NoNameSleep time.Duration
+	BackoffMin  time.Duration
+	BackoffMax  time.Duration
 }
 
 // SocketShim is a Shim over the wake socket at Path.
@@ -91,7 +91,7 @@ func (c Config) withDefaults() Config {
 	def(&c.Poll, DefaultPoll)
 	def(&c.Stuck, DefaultStuck)
 	def(&c.MinSpacing, DefaultMinSpacing)
-	def(&c.NoChannelsSleep, DefaultNoChannelsSleep)
+	def(&c.NoNameSleep, DefaultNoNameSleep)
 	def(&c.BackoffMin, DefaultBackoffMin)
 	def(&c.BackoffMax, DefaultBackoffMax)
 	return c
@@ -156,9 +156,9 @@ func (r *runner) idle(ctx context.Context) (state, error) {
 	switch rep.Status {
 	case protocol.WaitPending:
 		return stFire, nil
-	case protocol.WaitNoChannels:
-		r.Log.Info("no channels to wait for")
-		return stIdle, r.Clock.Sleep(ctx, r.NoChannelsSleep)
+	case protocol.WaitNoName:
+		r.Log.Info("no name to wait for")
+		return stIdle, r.Clock.Sleep(ctx, r.NoNameSleep)
 	case protocol.WaitRearm:
 		return stIdle, nil
 	}

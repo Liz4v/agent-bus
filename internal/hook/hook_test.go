@@ -117,7 +117,7 @@ func inputWithTasks(cmds ...string) string {
 	return string(b)
 }
 
-var unread = statusJSON(protocol.StatusReply{Count: 2, From: []string{"h/a"}, LiveChannels: 1, Armed: true})
+var unread = statusJSON(protocol.StatusReply{Count: 2, From: []string{"alice"}, Named: true, Armed: true})
 
 func TestStopHookActiveIsSilent(t *testing.T) {
 	sock := statusServer(t, unread)
@@ -211,19 +211,19 @@ func TestAncestryIgnoresUntrustedDirectory(t *testing.T) {
 	}
 }
 
-func TestUnreadContextHasLabelsNotContent(t *testing.T) {
+func TestUnreadContextHasNamesNotContent(t *testing.T) {
 	sock := statusServer(t, statusJSON(protocol.StatusReply{
-		Count: 3, From: []string{"h/a", `evil" label`, "agent-bus", "<x>/y"}, LiveChannels: 1, Armed: true}))
+		Count: 3, From: []string{"alice", `evil" name`, "agent-bus", "<x>/y", "h/a"}, Named: true, Armed: true}))
 	r := execHook(t, inputWithTasks("agent-bus wait --socket "+sock), nil)
 	ctx := r.context(t)
-	if !strings.Contains(ctx, "3 unread") || !strings.Contains(ctx, "h/a, agent-bus") || strings.Contains(ctx, "evil") ||
-		strings.Contains(ctx, "<x>") || !strings.Contains(ctx, "read tool") {
+	if !strings.Contains(ctx, "3 unread") || !strings.Contains(ctx, "alice, agent-bus") || strings.Contains(ctx, "evil") ||
+		strings.Contains(ctx, "<x>") || strings.Contains(ctx, "h/a") || !strings.Contains(ctx, "read tool") {
 		t.Fatalf("context: %q", ctx)
 	}
 }
 
 func TestNotArmed(t *testing.T) {
-	sock := statusServer(t, statusJSON(protocol.StatusReply{LiveChannels: 1, Armed: false, From: []string{}}))
+	sock := statusServer(t, statusJSON(protocol.StatusReply{Named: true, Armed: false, From: []string{}}))
 	// located by ancestry: no wait task is running
 	r := execHook(t, `{}`, ancestry(t, sock, 0o700, "ppid-300"))
 	if !strings.Contains(r.context(t), "wake is not armed") {
@@ -238,8 +238,10 @@ func TestNotArmed(t *testing.T) {
 
 func TestNothingToReport(t *testing.T) {
 	for name, st := range map[string]protocol.StatusReply{
-		"armed":       {LiveChannels: 1, Armed: true},
-		"no channels": {},
+		"armed":                  {Named: true, Armed: true},
+		"no name":                {},
+		"old shim (no named)":    {Armed: false}, // a status without the field decodes as unnamed: fail open
+		"no name, not armed too": {From: []string{}},
 	} {
 		sock := statusServer(t, statusJSON(st))
 		if r := execHook(t, inputWithTasks("agent-bus wait --socket "+sock), nil); r.stdout != "" || r.code != 0 {
@@ -250,11 +252,11 @@ func TestNothingToReport(t *testing.T) {
 
 func TestStatusErrorHandling(t *testing.T) {
 	msg := "broker down"
-	quiet := statusServer(t, statusJSON(protocol.StatusReply{Count: 0, LiveChannels: 1, Error: &msg}))
+	quiet := statusServer(t, statusJSON(protocol.StatusReply{Count: 0, Named: true, Error: &msg}))
 	if r := execHook(t, inputWithTasks("agent-bus wait --socket "+quiet), nil); r.stdout != "" {
 		t.Fatalf("error with count 0 must be silent: %+v", r)
 	}
-	loud := statusServer(t, statusJSON(protocol.StatusReply{Count: 1, From: []string{"h/a"}, LiveChannels: 1, Error: &msg}))
+	loud := statusServer(t, statusJSON(protocol.StatusReply{Count: 1, From: []string{"alice"}, Named: true, Error: &msg}))
 	r := execHook(t, inputWithTasks("agent-bus wait --socket "+loud), nil)
 	if !strings.Contains(r.context(t), "1 unread") {
 		t.Fatalf("unread rows must be reported even with an error: %+v", r)
@@ -288,8 +290,8 @@ func TestEveryErrorPathExitsZeroSilently(t *testing.T) {
 }
 
 func TestSubscribedUnarmedSessionGetsTheReminder(t *testing.T) {
-	// No live channels, but subscribed to admin notifications: the wake must be armed.
-	sock := statusServer(t, statusJSON(protocol.StatusReply{LiveChannels: 0, Subscribed: true, Armed: false, From: []string{}}))
+	// No name, but subscribed to admin notifications: the wake must be armed.
+	sock := statusServer(t, statusJSON(protocol.StatusReply{Subscribed: true, Armed: false, From: []string{}}))
 	r := execHook(t, `{}`, ancestry(t, sock, 0o700, "ppid-300"))
 	if !strings.Contains(r.context(t), "wake is not armed") {
 		t.Fatalf("%+v", r)
@@ -301,13 +303,27 @@ func TestSubscribedUnarmedSessionGetsTheReminder(t *testing.T) {
 }
 
 func TestSubscribedArmedSessionGetsNoReminder(t *testing.T) {
-	sock := statusServer(t, statusJSON(protocol.StatusReply{LiveChannels: 0, Subscribed: true, Armed: true, From: []string{}}))
+	sock := statusServer(t, statusJSON(protocol.StatusReply{Subscribed: true, Armed: true, From: []string{}}))
 	if r := execHook(t, `{}`, ancestry(t, sock, 0o700, "ppid-300")); r.stdout != "" || r.code != 0 {
 		t.Fatalf("%+v", r)
 	}
-	// Not subscribed and no channels: nothing to say either.
+	// Not subscribed and no name: nothing to say either.
 	sock = statusServer(t, statusJSON(protocol.StatusReply{From: []string{}}))
 	if r := execHook(t, `{}`, ancestry(t, sock, 0o700, "ppid-301")); r.stdout != "" {
+		t.Fatalf("%+v", r)
+	}
+}
+
+func TestNamedUnarmedSessionGetsTheReminderAndAnOldShimStatusIsSilent(t *testing.T) {
+	// A status written by a shim from before names has live_channels and no
+	// "named": it decodes as unnamed, so the hook says nothing (it fails open).
+	old := statusServer(t, `{"count":0,"from":[],"live_channels":1,"armed":false,"error":null,"cursor":0,"subscribed":false}`)
+	if r := execHook(t, `{}`, ancestry(t, old, 0o700, "ppid-300")); r.stdout != "" || r.code != 0 {
+		t.Fatalf("an old shim's status: %+v", r)
+	}
+	// A named session whose wake is not armed is reminded.
+	named := statusServer(t, statusJSON(protocol.StatusReply{Named: true, Armed: false, From: []string{}}))
+	if r := execHook(t, `{}`, ancestry(t, named, 0o700, "ppid-300")); !strings.Contains(r.context(t), "wake is not armed") {
 		t.Fatalf("%+v", r)
 	}
 }
